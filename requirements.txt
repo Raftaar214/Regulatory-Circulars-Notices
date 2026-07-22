@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+beautifulsoup4
+lxml
+curl_cffi
+cloudscraper
+requests
+python-multipart
