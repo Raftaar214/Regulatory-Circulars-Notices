@@ -984,7 +984,7 @@ def _build_dataset(from_date: datetime.date, to_date: datetime.date, force_refre
         "source_status": status,
         "from_date": from_date.isoformat(),
         "to_date": to_date.isoformat(),
-        "fetched_at": datetime.datetime.now().isoformat(),
+        "fetched_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
     }
     _cache_set(cache_key, result)
     return result
