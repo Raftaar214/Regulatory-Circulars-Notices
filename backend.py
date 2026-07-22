@@ -1052,3 +1052,25 @@ def get_all_notices(
 @app.get("/api/health")
 def health():
     return {"status": "ok", "time": datetime.datetime.now().isoformat()}
+from fastapi.responses import HTMLResponse
+
+@app.get("/", response_class=HTMLResponse)
+def home():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Regulatory Notices Dashboard API</title>
+    </head>
+    <body style="font-family: Arial; margin:40px;">
+        <h1>✅ Regulatory Notices Dashboard API</h1>
+        <p>Backend is running successfully.</p>
+
+        <ul>
+            <li><a href="/docs">Swagger Documentation</a></li>
+            <li><a href="/api/health">Health Check</a></li>
+            <li><a href="/api/notices">Latest Notices</a></li>
+        </ul>
+    </body>
+    </html>
+    """
