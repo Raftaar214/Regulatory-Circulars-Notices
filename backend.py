@@ -9,10 +9,10 @@ from typing import List, Dict, Optional, Any
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
+import datetime
 from zoneinfo import ZoneInfo
 
-fetched_at = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
+fetched_at = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("notices-backend")
@@ -941,12 +941,6 @@ from bs4 import BeautifulSoup
 import datetime as dt
 
 
-# ===========================================================================
-# DGCX Notices
-# ===========================================================================
-DGCX_BASE = "https://www.dgcx.ae"
-
-
 
 # ===========================================================================
 # Aggregation endpoint
@@ -984,8 +978,8 @@ def _build_dataset(from_date: datetime.date, to_date: datetime.date, force_refre
         "source_status": status,
         "from_date": from_date.isoformat(),
         "to_date": to_date.isoformat(),
-         "version": "2026-07-22-v2",
-        "fetched_at": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+        "version": "2026-07-22-v2",
+        "fetched_at": datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
     }
     _cache_set(cache_key, result)
     return result
@@ -1001,15 +995,17 @@ def get_all_notices(
     SEBI, MCX, MCXCCL, IFSCA for the given date window (default:
     last 30 days). No mock data - each source's row count and any error is
     under `source_status`."""
-    today = datetime.date.today()
-    to_d = datetime.date.fromisoformat(to_date) if to_date else today
+    today = datetime.datetime.now(
+    ZoneInfo("Asia/Kolkata")
+).date()
+    to_d = datetime.datetime.fromisoformat(to_date).date() if to_date else today
     from_d = datetime.date.fromisoformat(from_date) if from_date else (to_d - datetime.timedelta(days=30))
     return _build_dataset(from_d, to_d, force_refresh=refresh)
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok",  "time": datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),  "version": "2026-07-22-v2"}
+    return {"status": "ok",  "time": datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),  "version": "2026-07-22-v2"}
 from fastapi.responses import HTMLResponse
 
 @app.get("/", response_class=HTMLResponse)
