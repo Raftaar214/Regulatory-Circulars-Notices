@@ -33,7 +33,10 @@
         const { useState, useEffect, useMemo } = React;
 
         // Change this if your backend runs somewhere other than localhost:8000
-        const API_BASE = 'http://localhost:8000';
+        const API_BASE =
+            window.location.hostname === "localhost"
+               ? "http://localhost:8000"
+               : "https://regulatory-circulars-notices.onrender.com";
         const PAGE_SIZE = 50;
 
         const toISODate = (d) => d.toISOString().slice(0, 10);
