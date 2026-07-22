@@ -1,50 +1,3 @@
-"""
-Regulatory Notices Dashboard - Backend
-=======================================
-Fetches REAL circulars / notices / press releases from NSE, NSE Clearing,
-BSE, SEBI, MCX, MCXCCL, IFSCA - no mock data.
-
-CONFIRMED LIVE ENDPOINTS (found via browser DevTools):
----------------------------------------------------------------
-- NSE Circulars       GET https://www.nseindia.com/api/circulars?fromDate=DD-MM-YYYY&toDate=DD-MM-YYYY
-- NSE Press Releases   GET https://www.nseindia.com/api/press-release-cms20?fromDate=DD-MM-YYYY&toDate=DD-MM-YYYY
-- NSE Clearing (NCL)   GET https://www.nseclearing.in/api/circulars?fromDate=DD-MM-YYYY&toDate=DD-MM-YYYY
-                       (falls back to clearing-tagged rows in the NSE circulars feed if NCL's own API 404s)
-- BSE Notices          GET https://api.bseindia.com/BseIndiaAPI/api/getDataAdvance_New/w?strTxtDate=YYYY-MM-DD&strTxtTodate=YYYY-MM-DD&...
-- BSE Press Releases   GET https://api.bseindia.com/BseIndiaAPI/api/GetMediareleaseData/w?strCategory=&strYear=YYYY
-- SEBI Updates         GET https://www.sebi.gov.in/sebiweb/ajax/home/entrylist.jsp (HTML fragment, not JSON -
-                       see fetch_sebi_whats_new for why and how it's parsed)
-- MCX Circulars        POST https://www.mcxindia.com/backpage.aspx/GetCircularSearch (ASP.NET webmethod)
-- MCXCCL Circulars     POST https://www.mcxccl.com/backpage.aspx/GetCircularSearch (same webmethod shape)
-- IFSCA                GET https://ifsca.gov.in/Legal/Index/wF6kttc1JR8= (HTML index, anchor-tag scrape,
-                       no per-item dates - see fetch_ifsca)
-
-MCX/MCXCCL history: an earlier version of this file removed MCX entirely
-after its WAF (Akamai) blocked every approach tried, including a full
-real-Chromium browser filling in the form and clicking Show, and concluded
-it was an IP-level block. It's back here because curl_cffi's TLS-level
-Chrome impersonation (see new_session() below) is what a companion scraper
-against these same endpoints uses successfully. If MCX/MCXCCL/ still
-error out for you, the most likely fix is running the backend from an
-Indian IP - NSE, BSE and MCX all throttle foreign/datacenter IPs hard.
-
-DEFAULT WINDOW: last 30 days (configurable via ?from_date=&to_date= on
-/api/notices, both as YYYY-MM-DD).
-
-FIELD-NAME CAVEAT: I don't have network access to these domains myself, so
-some field names (especially SEBI's, and any BSE/NSE-press-release row that
-doesn't match) are educated guesses. Parsing is written defensively - if a
-source's row doesn't match any known key, the raw keys of the first row are
-logged and surfaced in that source's `note`/`error` so a quick fix is a
-one-line change, not another guessing round.
-
-Install:
-    pip install fastapi uvicorn requests beautifulsoup4 cloudscraper curl_cffi lxml
-
-Run:
-    uvicorn backend:app --reload --port 8000
-"""
-
 import datetime
 import html
 import json
@@ -56,6 +9,10 @@ from typing import List, Dict, Optional, Any
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+fetched_at = datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("notices-backend")
