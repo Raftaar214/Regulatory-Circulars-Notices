@@ -1,6 +1,7 @@
 import datetime
 import html
 import json
+import os
 import logging
 import re
 import time
@@ -66,16 +67,25 @@ app.add_middleware(
 # require re-scraping if you flip back to a range you already fetched.
 # ---------------------------------------------------------------------------
 import threading
+
 _CACHE: Dict[str, Dict] = {}
+
+CACHE_FILE = "cache.json"
 CACHE_TTL_SECONDS = 24 * 60 * 60
+
 CACHE_LOCK = threading.Lock()
 CACHE_REFRESHING = False
 
 
-
 def _cache_get(key: str):
     """Return cached data if it has not expired."""
+
     entry = _CACHE.get(key)
+
+    # If RAM cache is empty, try loading cache.json
+    if entry is None:
+        _load_cache_file()
+        entry = _CACHE.get(key)
 
     if not entry:
         return None
@@ -89,16 +99,59 @@ def _cache_get(key: str):
     logger.info("Cache expired.")
     return None
 
+
 def _cache_set(key: str, data):
-    """Store new cache and automatically overwrite old cache."""
+    """Store cache in RAM and on disk."""
 
     _CACHE[key] = {
         "data": data,
         "ts": time.time(),
     }
 
+    _save_cache_file()
+
     logger.info("Cache updated successfully.")
 
+
+def _save_cache_file():
+    """Save RAM cache to cache.json."""
+
+    try:
+
+        tmp = CACHE_FILE + ".tmp"
+
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_CACHE, f, ensure_ascii=False)
+
+        os.replace(tmp, CACHE_FILE)
+
+        logger.info("Disk cache saved.")
+
+    except Exception:
+        logger.exception("Failed to save cache.json")
+
+
+def _load_cache_file():
+    """Load cache.json into RAM."""
+
+    global _CACHE
+
+    if not os.path.exists(CACHE_FILE):
+        logger.info("No cache.json found.")
+        return
+
+    try:
+
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            _CACHE = json.load(f)
+
+        logger.info(f"Loaded cache.json ({len(_CACHE)} entries)")
+
+    except Exception:
+        logger.exception("Failed to load cache.json")
+
+# Load cache.json when backend starts
+_load_cache_file()        
 
 def _clean(text: Optional[str]) -> str:
     if not text:
