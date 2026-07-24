@@ -5,12 +5,12 @@ import logging
 import re
 import time
 from typing import List, Dict, Optional, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from zoneinfo import ZoneInfo
 
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-import datetime
-from zoneinfo import ZoneInfo
 
 fetched_at = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
 
@@ -65,26 +65,45 @@ app.add_middleware(
 # Cache - keyed by (from_date, to_date) so switching the date window doesn't
 # require re-scraping if you flip back to a range you already fetched.
 # ---------------------------------------------------------------------------
+import threading
 _CACHE: Dict[str, Dict] = {}
-CACHE_TTL_SECONDS = 15 * 60
+CACHE_TTL_SECONDS = 24 * 60 * 60
+CACHE_LOCK = threading.Lock()
+CACHE_REFRESHING = False
+
 
 
 def _cache_get(key: str):
+    """Return cached data if it has not expired."""
     entry = _CACHE.get(key)
-    if entry and (time.time() - entry["ts"]) < CACHE_TTL_SECONDS:
+
+    if not entry:
+        return None
+
+    age = time.time() - entry["ts"]
+
+    if age < CACHE_TTL_SECONDS:
+        logger.info(f"Serving cache ({int(age)} sec old)")
         return entry["data"]
+
+    logger.info("Cache expired.")
     return None
 
-
 def _cache_set(key: str, data):
-    _CACHE[key] = {"data": data, "ts": time.time()}
+    """Store new cache and automatically overwrite old cache."""
+
+    _CACHE[key] = {
+        "data": data,
+        "ts": time.time(),
+    }
+
+    logger.info("Cache updated successfully.")
 
 
 def _clean(text: Optional[str]) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
-
 
 def _parse_date_loose(text: Any) -> Optional[str]:
     """Try common exchange date formats -> 'YYYY-MM-DD'."""
@@ -946,45 +965,128 @@ import datetime as dt
 # Aggregation endpoint
 # ===========================================================================
 def _build_dataset(from_date: datetime.date, to_date: datetime.date, force_refresh: bool = False) -> Dict:
+    global CACHE_REFRESHING
+
     cache_key = f"dataset:{from_date.isoformat()}:{to_date.isoformat()}"
+
+    # -------------------------------------------------------
+    # Serve cache for normal visitors
+    # -------------------------------------------------------
     if not force_refresh:
         cached = _cache_get(cache_key)
         if cached is not None:
             return cached
 
-    sources = {
-        "NSE Circulars": fetch_nse_circulars(from_date, to_date),
-        "NSE Press Releases": fetch_nse_press_releases(from_date, to_date),
-        "NSE Clearing": fetch_nse_clearing(from_date, to_date),
-        "BSE Notices": fetch_bse_notices(from_date, to_date),
-        "BSE Press Releases": fetch_bse_press_releases(from_date, to_date),
-        "SEBI Updates": fetch_sebi_whats_new(from_date, to_date),
-        "MCX Circulars": fetch_mcx(from_date, to_date),
-        "MCXCCL Circulars": fetch_mcxccl(from_date, to_date),
-        "IFSCA": fetch_ifsca(from_date, to_date),
-    }
+    # -------------------------------------------------------
+    # If refresh already running, return current cache
+    # -------------------------------------------------------
+    if force_refresh and CACHE_REFRESHING:
+        logger.info("Refresh already running. Returning existing cache.")
 
-    all_notices: List[Dict] = []
-    status: Dict[str, Dict] = {}
-    for name, result in sources.items():
-        all_notices.extend(result["data"])
-        status[name] = {"count": len(result["data"]), "error": result["error"], "note": result.get("note")}
+        cached = _cache_get(cache_key)
+        if cached is not None:
+            return cached
 
-    all_notices.sort(key=lambda x: x["date"], reverse=True)
+    # -------------------------------------------------------
+    # Only one refresh at a time
+    # -------------------------------------------------------
+    with CACHE_LOCK:
 
-    result = {
-        "data": all_notices,
-        "total": len(all_notices),
-        "source_status": status,
-        "from_date": from_date.isoformat(),
-        "to_date": to_date.isoformat(),
-        "version": "2026-07-22-v2",
-        "fetched_at": datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
-    }
-    _cache_set(cache_key, result)
-    return result
+        if force_refresh:
+            CACHE_REFRESHING = True
 
+        try:
 
+            logger.info("Building latest dataset...")
+
+            jobs = {
+                "NSE Circulars": fetch_nse_circulars,
+                "NSE Press Releases": fetch_nse_press_releases,
+                "NSE Clearing": fetch_nse_clearing,
+                "BSE Notices": fetch_bse_notices,
+                "BSE Press Releases": fetch_bse_press_releases,
+                "SEBI Updates": fetch_sebi_whats_new,
+                "MCX Circulars": fetch_mcx,
+                "MCXCCL Circulars": fetch_mcxccl,
+                "IFSCA": fetch_ifsca,
+            }
+
+            sources = {}
+
+            with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+
+                future_map = {
+                    executor.submit(func, from_date, to_date): name
+                    for name, func in jobs.items()
+                }
+
+                for future in as_completed(future_map):
+
+                    name = future_map[future]
+
+                    try:
+                        sources[name] = future.result()
+                        logger.info(f"✓ {name} completed")
+
+                    except Exception as e:
+                        logger.exception(f"{name} failed")
+
+                        sources[name] = {
+                            "data": [],
+                            "error": str(e),
+                            "note": "Fetch failed",
+                        }
+
+            all_notices: List[Dict] = []
+            status: Dict[str, Dict] = {}
+
+            for name, src in sources.items():
+
+                all_notices.extend(src["data"])
+
+                status[name] = {
+                    "count": len(src["data"]),
+                    "error": src["error"],
+                    "note": src.get("note"),
+                }
+
+            all_notices.sort(key=lambda x: x["date"], reverse=True)
+
+            result = {
+                "data": all_notices,
+                "total": len(all_notices),
+                "source_status": status,
+                "from_date": from_date.isoformat(),
+                "to_date": to_date.isoformat(),
+                "version": "2026-07-22-v3",
+                "fetched_at": datetime.datetime.now(
+                    ZoneInfo("Asia/Kolkata")
+                ).isoformat(),
+            }
+
+            # Replace old cache with new cache
+            _cache_set(cache_key, result)
+
+            logger.info(
+                f"Cache updated successfully with {len(all_notices)} notices."
+            )
+
+            return result
+
+        except Exception:
+
+            logger.exception("Dataset refresh failed.")
+
+            cached = _cache_get(cache_key)
+
+            if cached is not None:
+                logger.info("Returning previous cache.")
+                return cached
+
+            raise
+
+        finally:
+            CACHE_REFRESHING = False
 @app.get("/api/notices")
 def get_all_notices(
     refresh: bool = Query(False, description="Force a fresh fetch, bypassing the cache"),
