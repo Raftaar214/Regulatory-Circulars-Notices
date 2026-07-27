@@ -71,7 +71,6 @@ import threading
 _CACHE: Dict[str, Dict] = {}
 
 CACHE_FILE = "cache.json"
-CACHE_TTL_SECONDS = 24 * 60 * 60
 
 CACHE_LOCK = threading.Lock()
 CACHE_REFRESHING = False
@@ -90,18 +89,14 @@ def _cache_get(key: str):
     if not entry:
         return None
 
-    age = time.time() - entry["ts"]
-
-    if age < CACHE_TTL_SECONDS:
-        logger.info(f"Serving cache ({int(age)} sec old)")
-        return entry["data"]
-
-    logger.info("Cache expired.")
-    return None
+    logger.info("Serving cached dataset")
+    return entry["data"]
 
 
 def _cache_set(key: str, data):
     """Store cache in RAM and on disk."""
+
+    _CACHE.clear()
 
     _CACHE[key] = {
         "data": data,
@@ -1127,13 +1122,13 @@ import datetime as dt
 # ===========================================================================
 # Aggregation endpoint
 # ===========================================================================
-def _build_dataset(from_date: datetime.date, to_date: datetime.date, force_refresh: bool = False) -> Dict:
+def _build_dataset(from_date, to_date, force_refresh=False):
     global CACHE_REFRESHING
 
-    cache_key = f"dataset:{from_date.isoformat()}:{to_date.isoformat()}"
+    cache_key = "latest_dataset"
 
     # -------------------------------------------------------
-    # Serve cache for normal visitors
+    # Normal visitors -> always serve cache if available
     # -------------------------------------------------------
     if not force_refresh:
         cached = _cache_get(cache_key)
@@ -1141,9 +1136,9 @@ def _build_dataset(from_date: datetime.date, to_date: datetime.date, force_refre
             return cached
 
     # -------------------------------------------------------
-    # If refresh already running, return current cache
+    # Prevent multiple refreshes
     # -------------------------------------------------------
-    if force_refresh and CACHE_REFRESHING:
+    if CACHE_REFRESHING:
         logger.info("Refresh already running. Returning existing cache.")
 
         cached = _cache_get(cache_key)
@@ -1151,15 +1146,18 @@ def _build_dataset(from_date: datetime.date, to_date: datetime.date, force_refre
             return cached
 
     # -------------------------------------------------------
-    # Only one refresh at a time
+    # Only one refresh thread
     # -------------------------------------------------------
     with CACHE_LOCK:
 
-        if force_refresh:
-            CACHE_REFRESHING = True
+        if not force_refresh:
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                return cached
+
+        CACHE_REFRESHING = True
 
         try:
-
             logger.info("Building latest dataset...")
 
             jobs = {
