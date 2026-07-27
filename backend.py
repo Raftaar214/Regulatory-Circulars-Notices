@@ -787,7 +787,7 @@ def fetch_nse_clearing(from_date: datetime.date, to_date: datetime.date) -> Dict
         resp.raise_for_status()
 
         rows = resp.json()
-
+        
         if isinstance(rows, dict):
             rows = (
                 rows.get("data")
@@ -845,6 +845,108 @@ def fetch_nse_clearing(from_date: datetime.date, to_date: datetime.date) -> Dict
         "note": None,
     }
 
+# ===========================================================================
+# NSE CORPORATE ACTIONS (DIVIDEND)
+# ===========================================================================
+
+from urllib.parse import quote
+
+
+def fetch_nse_corporate_actions(from_date: datetime.date,
+                                to_date: datetime.date) -> Dict:
+
+    notices = []
+    error = None
+
+    try:
+        session = _nse_warmup_session()
+
+        response = session.get(
+            "https://www.nseindia.com/api/corporates-corporateActions",
+            params={
+                "index": "equities"
+            },
+            headers={
+                "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-actions"
+            },
+            timeout=REQUEST_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        rows = response.json()
+
+        logger.info("Dividend API response type: %s", type(rows))
+
+        if isinstance(rows, dict):
+            logger.info("Dividend API keys: %s", rows.keys())
+            rows = rows.get("data", [])
+
+        logger.info("Dividend rows received: %d", len(rows))
+
+        for row in rows:
+
+            ex_date = _parse_date_loose(row.get("exDate"))
+
+            if not ex_date:
+                continue
+
+            d = datetime.date.fromisoformat(ex_date)
+
+            if d < from_date or d > to_date:
+                continue
+
+            symbol = (row.get("symbol") or "").strip()
+            company = (row.get("comp") or "").strip()
+
+            # Create NSE quote URL
+            company_slug = (
+                company
+                .replace("(", "")
+                .replace(")", "")
+                .replace(",", "")
+                .replace(".", "")
+                .replace("/", "-")
+                .replace(" ", "-")
+            )
+
+            link = (
+                f"https://www.nseindia.com/get-quote/equity/"
+                f"{quote(symbol)}/{quote(company_slug, safe='-')}"
+            )
+
+            notices.append({
+                "id": f"dividend-{symbol}-{ex_date}",
+
+                "type": "dividend",
+
+                "body": "NSE",
+
+                "category": "Dividend",
+
+                "date": ex_date,
+
+                "title": company,
+
+                "symbol": symbol,
+                "company": company,
+                "subject": row.get("subject", ""),
+                "ex_date": ex_date,
+                "record_date": _parse_date_loose(row.get("recDate")),
+                "face_value": row.get("faceVal", ""),
+
+                # Dynamic NSE Quote Link
+                "link": link,
+            })
+
+    except Exception as e:
+        logger.exception("Dividend fetch failed")
+        error = str(e)
+
+    return {
+        "data": notices,
+        "error": error
+    }
 # ===========================================================================
 # MCX / MCXCCL - ASP.NET webmethod (backpage.aspx/GetCircularSearch), with a
 # fallback that scrapes circular PDF links straight off the listing page.
@@ -1055,6 +1157,7 @@ def _build_dataset(from_date: datetime.date, to_date: datetime.date, force_refre
             jobs = {
                 "NSE Circulars": fetch_nse_circulars,
                 "NSE Press Releases": fetch_nse_press_releases,
+                "NSE Dividend": fetch_nse_corporate_actions,
                 "NSE Clearing": fetch_nse_clearing,
                 "BSE Notices": fetch_bse_notices,
                 "BSE Press Releases": fetch_bse_press_releases,
@@ -1183,3 +1286,9 @@ def home():
     </body>
     </html>
     """
+@app.get("/test-dividend")
+def test_dividend():
+    today = datetime.date.today()
+    from_date = today - datetime.timedelta(days=30)
+
+    return fetch_nse_corporate_actions(from_date, today)
