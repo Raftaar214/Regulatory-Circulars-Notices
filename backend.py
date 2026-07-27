@@ -533,9 +533,17 @@ def fetch_bse_press_releases(from_date: datetime.date, to_date: datetime.date) -
         logger.exception("BSE press release fetch failed")
         error = f"BSE press release fetch failed: {e}"
     if not notices and not error:
-        error = "BSE press release API returned 0 rows for this date range."
-    return {"data": notices, "error": error}
+     return {
+        "data": [],
+        "error": None,
+        "note": "No press releases published during the selected date range."
+    }
 
+    return {
+    "data": notices,
+    "error": error,
+    "note": None,
+}
 
 # ===========================================================================
 # SEBI - "What's New" feed (HTML fragment, grouped by date then category)
