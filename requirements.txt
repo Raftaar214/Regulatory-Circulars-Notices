@@ -7,3 +7,4 @@ cloudscraper
 requests
 python-multipart
 python-dotenv
+pypdf
