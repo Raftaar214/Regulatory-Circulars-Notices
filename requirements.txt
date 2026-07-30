@@ -6,3 +6,4 @@ curl_cffi
 cloudscraper
 requests
 python-multipart
+python-dotenv

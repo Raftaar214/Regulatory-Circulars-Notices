@@ -9,14 +9,60 @@ from typing import List, Dict, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
 
+import asyncio
+import requests
+import io
+import pypdf
+
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # python-dotenv isn't installed - that's fine in production if the host
+    # (Render, etc.) injects real environment variables directly instead of
+    # a .env file. Add `python-dotenv` to requirements.txt for local dev.
+    pass
 
 fetched_at = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("notices-backend")
+
+# ---------------------------------------------------------------------------
+# AI summary + auto-refresh configuration.
+#
+# Everything here is overridable via environment variables so you can tune
+# behaviour (or swap models) with no code change - e.g. once you move off
+# the free tier. Google changes Gemini free-tier model names and rate
+# limits without much notice, so GEMINI_MODEL in particular is worth
+# checking against https://ai.google.dev/gemini-api/docs/models and
+# https://ai.google.dev/gemini-api/docs/rate-limits if this ever starts
+# 404-ing or getting rate-limited harder than expected.
+# ---------------------------------------------------------------------------
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
+GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+# How many un-summarized notices to send to Gemini in a single request, and
+# how long to sleep between chunks. Defaults are deliberately conservative
+# (~10 requests/minute) so a cold start (hundreds of notices with no
+# summary yet) survives comfortably inside free-tier rate limits instead of
+# tripping 429s. Raise these once you're on a paid tier.
+SUMMARY_CHUNK_SIZE = int(os.environ.get("SUMMARY_CHUNK_SIZE", "12"))
+SUMMARY_CHUNK_DELAY_SECONDS = float(os.environ.get("SUMMARY_CHUNK_DELAY_SECONDS", "6"))
+SUMMARIES_FILE = os.environ.get("SUMMARIES_FILE", "summaries.json")
+
+# How often the backend re-scrapes every source and looks for notices that
+# still need a summary. Summaries already on disk are never regenerated.
+REFRESH_INTERVAL_SECONDS = int(os.environ.get("REFRESH_INTERVAL_SECONDS", str(60 * 60)))
+ENABLE_SCHEDULER = os.environ.get("ENABLE_SCHEDULER", "true").strip().lower() != "false"
+
+if not GEMINI_API_KEY:
+    logger.warning("GEMINI_API_KEY is not set - AI summaries will be skipped until it is.")
 
 try:
     from curl_cffi import requests as _curl_requests
@@ -148,10 +194,318 @@ def _load_cache_file():
 # Load cache.json when backend starts
 _load_cache_file()        
 
+# ---------------------------------------------------------------------------
+# AI summaries store - a separate, permanent JSON file keyed by notice id.
+# This is intentionally NOT part of cache.json: cache.json is disposable
+# (rebuilt from source sites every refresh), but summaries cost tokens to
+# create, so once a notice has a summary here it is never re-sent to Gemini.
+# Same tmp-file + os.replace atomic-write pattern as _save_cache_file above.
+# ---------------------------------------------------------------------------
+_SUMMARIES: Dict[str, Dict] = {}
+SUMMARIES_LOCK = threading.Lock()
+
+# Guards against two summarization passes running at once (one kicked off
+# by the hourly scheduler, one by a page load) - same idea as
+# CACHE_REFRESHING/CACHE_LOCK below for dataset refreshes.
+_SUMMARY_RUNNING = False
+_SUMMARY_RUN_LOCK = threading.Lock()
+
+
+def _load_summaries():
+    global _SUMMARIES
+
+    if not os.path.exists(SUMMARIES_FILE):
+        logger.info("No summaries.json found - AI summaries start empty.")
+        return
+
+    try:
+        with open(SUMMARIES_FILE, "r", encoding="utf-8") as f:
+            _SUMMARIES = json.load(f)
+        logger.info(f"Loaded summaries.json ({len(_SUMMARIES)} existing summaries)")
+    except Exception:
+        logger.exception("Failed to load summaries.json - starting with an empty summary store.")
+
+
+def _save_summaries():
+    try:
+        tmp = SUMMARIES_FILE + ".tmp"
+        with SUMMARIES_LOCK:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(_SUMMARIES, f, ensure_ascii=False)
+            os.replace(tmp, SUMMARIES_FILE)
+        logger.info("summaries.json saved (%d total summaries).", len(_SUMMARIES))
+    except Exception:
+        logger.exception("Failed to save summaries.json")
+
+
+# Load summaries.json when backend starts
+_load_summaries()
+
+
+def _decorate_with_summaries(notices: List[Dict]) -> List[Dict]:
+    """Return a shallow-copied list of notices, each with a `summary` field
+    merged in from the store (or None if it hasn't been generated yet). A
+    shallow copy is used deliberately so this never mutates the shared,
+    cached notice objects that `_CACHE` hands back to every caller."""
+    decorated = []
+    for n in notices:
+        entry = _SUMMARIES.get(n.get("id"))
+        row = dict(n)
+        row["summary"] = entry["summary"] if entry else None
+        row["summary_generated_at"] = entry.get("generated_at") if entry else None
+        decorated.append(row)
+    return decorated
+
+def _extract_text_from_url(url: str) -> str:
+    """Download a document (PDF or HTML) and extract its text."""
+    if not url:
+        return ""
+    try:
+        s = new_session()
+        s.headers.update(BROWSER_HEADERS)
+        resp = s.get(url, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+
+        content_type = resp.headers.get("Content-Type", "").lower()
+        if "pdf" in content_type or url.lower().endswith(".pdf"):
+            reader = pypdf.PdfReader(io.BytesIO(resp.content))
+            text = ""
+            for i, page in enumerate(reader.pages):
+                if i >= 5: # Limit to first 5 pages to save tokens
+                    break
+                text += page.extract_text() + "\n"
+            return text.strip()
+        elif "html" in content_type:
+            soup = BeautifulSoup(resp.content, "lxml")
+            return soup.get_text(separator=" ", strip=True)
+        else:
+            return ""
+    except Exception as e:
+        logger.warning(f"Failed to extract text from {url}: {e}")
+        return ""
+
+
+class GeminiRateLimited(Exception):
+    """Raised when Gemini returns HTTP 429 - signals the caller to stop
+    this summarization pass early rather than keep hammering the API."""
+    pass
+
+
+def _gemini_summarize_chunk(items: List[Dict]) -> Dict[str, str]:
+    """Send one batch of notices/dividends to Gemini in a single request
+    and return {id: summary}. Batching multiple items per call is what
+    keeps this inside free-tier request-per-minute/day limits - see
+    SUMMARY_CHUNK_SIZE."""
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+
+    payload_items = []
+    for it in items:
+        if it.get("type") == "dividend":
+            payload_items.append({
+                "id": it.get("id"),
+                "type": "dividend",
+                "company": it.get("company", ""),
+                "symbol": it.get("symbol", ""),
+                "subject": it.get("subject", ""),
+                "ex_date": it.get("ex_date", ""),
+            })
+        else:
+            notice_payload = {
+                "id": it.get("id"),
+                "type": "notice",
+                "body": it.get("body", ""),
+                "category": it.get("category", ""),
+                "title": _strip_html(it.get("title", "")),
+                "date": it.get("date", ""),
+            }
+            if "document_text" in it:
+                notice_payload["document_text"] = it["document_text"]
+            payload_items.append(notice_payload)
+
+    system_instruction = (
+        "You are a concise financial regulatory analyst. You will receive a JSON array of "
+        "Indian stock-market notices and dividend announcements, each with an 'id'. For every "
+        "item, write a single 1-2 sentence summary of its core impact or directive; for "
+        "dividends, mention the company, amount, and ex-date. Never use markdown formatting "
+        "such as bold or bullet points. Respond with ONLY a JSON array, no other text and no "
+        "markdown code fences, with exactly one object per input item in this exact shape: "
+        '[{"id": "<same id as input>", "summary": "<your 1-2 sentence summary>"}, ...]. '
+        "Reuse each input id unchanged so the caller can match summaries back to notices."
+    )
+
+    body = {
+        "contents": [{"parts": [{"text": json.dumps(payload_items, ensure_ascii=False)}]}],
+        "systemInstruction": {"parts": [{"text": system_instruction}]},
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 4096,
+            # Low temperature: these are short factual summaries, not
+            # creative writing - we want consistent, literal output rather
+            # than varied phrasing across runs.
+            "temperature": 0.2,
+        },
+    }
+
+    max_retries = 6
+    for attempt in range(max_retries):
+        resp = requests.post(
+            GEMINI_API_URL,
+            headers={"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"},
+            json=body,
+            timeout=60,
+        )
+
+        if resp.status_code == 429:
+            if attempt < max_retries - 1:
+                sleep_time = 2 ** attempt * 2  # 2s, 4s, 8s, 16s, 32s
+                logger.warning(f"Gemini rate limited (429). Retrying in {sleep_time}s (attempt {attempt + 1}/{max_retries})")
+                time.sleep(sleep_time)
+                continue
+            else:
+                raise GeminiRateLimited(resp.text[:300])
+
+        if resp.status_code >= 400:
+            raise RuntimeError(f"Gemini {resp.status_code}: {resp.text[:500]}")
+        
+        break
+
+    data = resp.json()
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError(f"Gemini returned no candidates: {json.dumps(data)[:500]}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts).strip()
+
+    # Defensive: strip stray markdown fences in case the model adds them
+    # despite the JSON-mode instruction.
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-zA-Z]*\n?", "", text)
+        text = re.sub(r"```$", "", text).strip()
+
+    parsed = json.loads(text)
+
+    out: Dict[str, str] = {}
+    for row in parsed:
+        rid = row.get("id")
+        summ = _clean(row.get("summary"))
+        if rid and summ:
+            out[rid] = summ
+    return out
+
+
+def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
+    """Find notices with no stored summary yet and summarize them in small
+    chunks, saving progress after every chunk so a rate-limit or crash
+    partway through never loses already-generated summaries and never
+    causes a previously-summarized notice to be re-sent to Gemini."""
+    if not GEMINI_API_KEY:
+        return {"generated": 0, "pending": len(notices)}
+
+    pending = [n for n in notices if n.get("id") and n["id"] not in _SUMMARIES]
+
+    if not pending:
+        logger.info("Summary pass: nothing new (%d notices already covered).", len(notices))
+        return {"generated": 0, "pending": 0}
+
+    logger.info("Summary pass: %d new notice(s) need AI summaries (model=%s).", len(pending), GEMINI_MODEL)
+
+    generated = 0
+
+    for i in range(0, len(pending), SUMMARY_CHUNK_SIZE):
+        chunk = pending[i:i + SUMMARY_CHUNK_SIZE]
+        
+        # Deep read extraction
+        deep_chunk = []
+        for n in chunk:
+            item = dict(n)
+            link = item.get("link")
+            if link:
+                try:
+                    doc_text = _extract_text_from_url(link)
+                    if doc_text:
+                        item["document_text"] = doc_text
+                except Exception as e:
+                    logger.warning("Failed to deep read %s: %s", link, e)
+            deep_chunk.append(item)
+
+        try:
+            result = _gemini_summarize_chunk(deep_chunk)
+        except GeminiRateLimited as e:
+            logger.warning("Gemini rate-limited - stopping this pass early, will resume next cycle. %s", e)
+            break
+        except Exception:
+            logger.exception("Gemini summarization failed for a chunk - skipping it this cycle.")
+            time.sleep(SUMMARY_CHUNK_DELAY_SECONDS)
+            continue
+
+        if result:
+            now_iso = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
+            for rid, summ in result.items():
+                _SUMMARIES[rid] = {
+                    "summary": summ,
+                    "model": GEMINI_MODEL,
+                    "generated_at": now_iso,
+                }
+            generated += len(result)
+            _save_summaries()  # persist after every chunk, not just at the end
+
+        time.sleep(SUMMARY_CHUNK_DELAY_SECONDS)
+
+    still_pending = sum(1 for n in notices if n.get("id") and n["id"] not in _SUMMARIES)
+    logger.info("Summary pass complete: %d generated, %d still pending.", generated, still_pending)
+
+    return {"generated": generated, "pending": still_pending}
+
+
+def _run_summary_pass_guarded(notices: List[Dict]):
+    """Thread entrypoint: runs _run_summary_pass then always clears the
+    running flag, even on error."""
+    global _SUMMARY_RUNNING
+    try:
+        _run_summary_pass(notices)
+    except Exception:
+        logger.exception("Summary pass crashed")
+    finally:
+        with _SUMMARY_RUN_LOCK:
+            _SUMMARY_RUNNING = False
+
+
+def _try_start_summary_pass() -> bool:
+    global _SUMMARY_RUNNING
+    with _SUMMARY_RUN_LOCK:
+        if _SUMMARY_RUNNING:
+            return False
+        _SUMMARY_RUNNING = True
+        return True
+
+
+def _maybe_kickoff_summary_pass(notices: List[Dict]):
+    """Fire-and-forget: start a background summarization pass if one isn't
+    already running and a Gemini key is configured. Safe to call on every
+    request - it's a cheap no-op once everything is caught up."""
+    if not GEMINI_API_KEY:
+        return
+    if not _try_start_summary_pass():
+        return
+    threading.Thread(target=_run_summary_pass_guarded, args=(notices,), daemon=True).start()
+
+
 def _clean(text: Optional[str]) -> str:
     if not text:
         return ""
     return re.sub(r"\s+", " ", str(text)).strip()
+
+def _strip_html(text: Optional[str]) -> str:
+    """A few NSE press-release titles embed literal <br/> tags between
+    multiple clarifications bundled into one row - turn those into a plain
+    separator instead of feeding raw markup to Gemini (or the DOM)."""
+    if not text:
+        return ""
+    text = re.sub(r"<br\s*/?>", "; ", str(text), flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return _clean(text)
 
 def _parse_date_loose(text: Any) -> Optional[str]:
     """Try common exchange date formats -> 'YYYY-MM-DD'."""
@@ -1202,12 +1556,21 @@ def _build_dataset(from_date, to_date, force_refresh=False):
             all_notices: List[Dict] = []
             status: Dict[str, Dict] = {}
 
+            from_iso = from_date.isoformat()
+            to_iso = to_date.isoformat()
+
             for name, src in sources.items():
 
-                all_notices.extend(src["data"])
+                filtered_data = [row for row in src["data"] if from_iso <= row.get("date", to_iso) <= to_iso]
+                
+                # Tag each row with its source name so we can recalculate counts later
+                for row in filtered_data:
+                    row["_source_key"] = name
+
+                all_notices.extend(filtered_data)
 
                 status[name] = {
-                    "count": len(src["data"]),
+                    "count": len(filtered_data),
                     "error": src["error"],
                     "note": src.get("note"),
                 }
@@ -1220,7 +1583,7 @@ def _build_dataset(from_date, to_date, force_refresh=False):
                 "source_status": status,
                 "from_date": from_date.isoformat(),
                 "to_date": to_date.isoformat(),
-                "version": "2026-07-22-v3",
+                "version": "2026-07-28-v4-ai-summaries",
                 "fetched_at": datetime.datetime.now(
                     ZoneInfo("Asia/Kolkata")
                 ).isoformat(),
@@ -1258,43 +1621,245 @@ def get_all_notices(
     """Returns notices/circulars/press releases from NSE, NSE Clearing, BSE,
     SEBI, MCX, MCXCCL, IFSCA for the given date window (default:
     last 30 days). No mock data - each source's row count and any error is
-    under `source_status`."""
+    under `source_status`.
+
+    Every row also carries a `summary` field, pre-generated by Gemini and
+    read straight from summaries.json - the browser never calls Gemini
+    itself, so every visitor sees the same already-paid-for summary instead
+    of triggering a new AI call. Rows with no summary yet show `summary:
+    null`; a background pass (hourly, or kicked off by this very request)
+    fills those in without ever re-summarizing a notice that already has
+    one - see `summary_status` in the response for progress."""
     today = datetime.datetime.now(
     ZoneInfo("Asia/Kolkata")
 ).date()
     to_d = datetime.datetime.fromisoformat(to_date).date() if to_date else today
     from_d = datetime.date.fromisoformat(from_date) if from_date else (to_d - datetime.timedelta(days=30))
-    return _build_dataset(from_d, to_d, force_refresh=refresh)
+
+    result = _build_dataset(from_d, to_d, force_refresh=refresh)
+    all_notices = result.get("data", [])
+    
+    # Filter the notices by the requested date range
+    raw_notices = []
+    
+    # We will recount the source_status for the filtered date range
+    new_source_status = {
+        k: {"count": 0, "error": v.get("error"), "note": v.get("note")}
+        for k, v in result.get("source_status", {}).items()
+    }
+    
+    for n in all_notices:
+        try:
+            d = datetime.date.fromisoformat(n["date"])
+            if from_d <= d <= to_d:
+                raw_notices.append(n)
+                src_key = n.get("_source_key")
+                if src_key and src_key in new_source_status:
+                    new_source_status[src_key]["count"] += 1
+        except Exception:
+            # If date parsing fails, include it to be safe
+            raw_notices.append(n)
+            src_key = n.get("_source_key")
+            if src_key and src_key in new_source_status:
+                new_source_status[src_key]["count"] += 1
+
+    decorated = _decorate_with_summaries(raw_notices)
+    have = sum(1 for d in decorated if d.get("summary"))
+
+    # Fire-and-forget: catch up on any notices this request just revealed
+    # that don't have a summary yet. Cheap no-op if a pass is already
+    # running or everything is already summarized.
+    _maybe_kickoff_summary_pass(raw_notices)
+
+    # Clean up _source_key before sending to frontend
+    for d in decorated:
+        d.pop("_source_key", None)
+        
+    # Create the final response payload with updated source_status
+    payload = dict(result)
+    payload["source_status"] = new_source_status
+    payload["total"] = len(decorated)
+
+    return {
+        **payload,
+        "data": decorated,
+        "summary_status": {
+            "generated": have,
+            "pending": len(decorated) - have,
+            "model": GEMINI_MODEL if GEMINI_API_KEY else None,
+        },
+    }
+
+
+@app.get("/api/summaries/status")
+def summaries_status():
+    """Lightweight progress check - how many notices in the current cache
+    have an AI summary, without needing to pull the full dataset."""
+    cached = _cache_get("latest_dataset") or {}
+    all_notices = cached.get("data", [])
+    have = sum(1 for n in all_notices if n.get("id") in _SUMMARIES)
+    return {
+        "total_notices": len(all_notices),
+        "summarized": have,
+        "pending": max(0, len(all_notices) - have),
+        "total_summaries_stored": len(_SUMMARIES),
+        "model": GEMINI_MODEL,
+        "gemini_key_configured": bool(GEMINI_API_KEY),
+        "pass_running": _SUMMARY_RUNNING,
+    }
+
+
+@app.post("/api/summaries/run-now")
+def run_summaries_now():
+    """Manually kick off a summarization pass over whatever's in the
+    current cache, without waiting for the next hourly cycle. Returns
+    immediately; the pass itself runs in a background thread."""
+    cached = _cache_get("latest_dataset")
+    if not cached:
+        return {"status": "no-data", "message": "No cached notices yet - call /api/notices first."}
+    if not GEMINI_API_KEY:
+        return {"status": "no-key", "message": "GEMINI_API_KEY is not set on the backend."}
+
+    if not _try_start_summary_pass():
+        return {"status": "already-running"}
+
+    threading.Thread(
+        target=_run_summary_pass_guarded, args=(cached.get("data", []),), daemon=True
+    ).start()
+    return {"status": "started"}
+
+
+@app.post("/api/summaries/notice/{notice_id:path}")
+def summarize_one(notice_id: str, force: bool = False):
+    """On-demand summary for a single notice - used by the "Generate now"
+    fallback in the UI so a visitor doesn't have to wait for the hourly
+    pass. Idempotent: if this id is already summarized, returns the
+    existing summary instead of spending another Gemini call on it."""
+    if not force:
+        existing = _SUMMARIES.get(notice_id)
+        if existing:
+            return {"status": "ok", "summary": existing["summary"], "cached": True}
+
+    if not GEMINI_API_KEY:
+        return {"status": "no-key", "message": "GEMINI_API_KEY is not set on the backend."}
+
+    cached = _cache_get("latest_dataset") or {}
+    notice = next((n for n in cached.get("data", []) if n.get("id") == notice_id), None)
+    if not notice:
+        return {"status": "not-found"}
+
+    notice_to_summarize = dict(notice)
+    link = notice_to_summarize.get("link")
+    if link:
+        doc_text = _extract_text_from_url(link)
+        if doc_text:
+            notice_to_summarize["document_text"] = doc_text
+
+    try:
+        result = _gemini_summarize_chunk([notice_to_summarize])
+    except GeminiRateLimited as e:
+        return {"status": "rate-limited", "message": str(e)}
+    except Exception as e:
+        logger.exception("On-demand summarize failed for %s", notice_id)
+        return {"status": "error", "message": str(e)}
+
+    summary = result.get(notice_id)
+    if not summary:
+        return {"status": "error", "message": "Model did not return a summary for this id."}
+
+    _SUMMARIES[notice_id] = {
+        "summary": summary,
+        "model": GEMINI_MODEL,
+        "generated_at": datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+    }
+    _save_summaries()
+
+    return {"status": "ok", "summary": summary, "cached": False}
+
+
+# ===========================================================================
+# Hourly background job: re-fetch every source, then summarize whatever's
+# new. Runs as an asyncio task on the same event loop FastAPI already uses;
+# the actual scraping/Gemini work happens in a thread executor so it never
+# blocks request handling. Single-process assumption: if this ever runs
+# behind multiple Uvicorn workers, move this loop to its own process/cron
+# job instead, or every worker will refresh + summarize independently.
+# ===========================================================================
+async def _refresh_and_summarize():
+    loop = asyncio.get_event_loop()
+    today = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    from_d = today - datetime.timedelta(days=30)
+
+    logger.info("Scheduled cycle: refreshing all sources...")
+    result = await loop.run_in_executor(None, _build_dataset, from_d, today, True)
+
+    status = result.get("source_status", {})
+    if not any(s.get("error") for s in status.values()):
+        valid_ids = {n.get("id") for n in result.get("data", []) if n.get("id")}
+        with SUMMARIES_LOCK:
+            keys_to_delete = [k for k in _SUMMARIES.keys() if k not in valid_ids]
+            for k in keys_to_delete:
+                del _SUMMARIES[k]
+        if keys_to_delete:
+            logger.info(f"Purged {len(keys_to_delete)} old summaries not in the last 30 days.")
+            _save_summaries()
+
+    if not _try_start_summary_pass():
+        logger.info("Scheduled cycle: a summary pass is already running - skipping.")
+        return
+
+    logger.info("Scheduled cycle: summarizing any new notices...")
+    await loop.run_in_executor(None, _run_summary_pass_guarded, result.get("data", []))
+
+
+async def _hourly_job_loop():
+    await asyncio.sleep(5)  # let the app finish starting first
+    while True:
+        try:
+            await _refresh_and_summarize()
+        except Exception:
+            logger.exception("Hourly refresh/summarize cycle failed")
+        await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def _on_startup():
+    if ENABLE_SCHEDULER:
+        logger.info(
+            "Starting hourly refresh+summarize loop (every %ss).", REFRESH_INTERVAL_SECONDS
+        )
+        asyncio.create_task(_hourly_job_loop())
+    else:
+        logger.info("ENABLE_SCHEDULER=false - hourly auto-refresh is disabled.")
 
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok",  "time": datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),  "version": "2026-07-22-v2"}
-from fastapi.responses import HTMLResponse
+    return {
+        "status": "ok",
+        "time": datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+        "version": "2026-07-28-v4-ai-summaries",
+        "scheduler_enabled": ENABLE_SCHEDULER,
+        "refresh_interval_seconds": REFRESH_INTERVAL_SECONDS,
+        "gemini_model": GEMINI_MODEL,
+        "gemini_key_configured": bool(GEMINI_API_KEY),
+    }
+from fastapi.responses import FileResponse, HTMLResponse
+import os
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=FileResponse)
 def home():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Regulatory Notices Dashboard API</title>
-    </head>
-    <body style="font-family: Arial; margin:40px;">
-        <h1>✅ Regulatory Notices Dashboard API</h1>
-        <p>Backend is running successfully.</p>
-
-        <ul>
-            <li><a href="/docs">Swagger Documentation</a></li>
-            <li><a href="/api/health">Health Check</a></li>
-            <li><a href="/api/notices">Latest Notices</a></li>
-        </ul>
-    </body>
-    </html>
-    """
+    index_path = os.path.join(os.path.dirname(__file__), "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return HTMLResponse("<h1>✅ Regulatory Notices Dashboard API</h1><p>Backend is running, but index.html was not found.</p>")
 @app.get("/test-dividend")
 def test_dividend():
     today = datetime.date.today()
     from_date = today - datetime.timedelta(days=30)
 
     return fetch_nse_corporate_actions(from_date, today)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
