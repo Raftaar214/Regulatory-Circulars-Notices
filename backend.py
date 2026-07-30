@@ -587,17 +587,32 @@ def _log_unknown_shape(source: str, rows: List[Dict]) -> str:
 NSE_BASE = "https://www.nseindia.com"
 
 
+_NSE_SESSION = None
+_NSE_WARMUP_LOCK = threading.Lock()
+
 def _nse_warmup_session():
     """NSE blocks direct API hits without first establishing browser-like
     cookies - hit the homepage before calling the API."""
-    s = new_session()
-    s.headers.update(BROWSER_HEADERS)
-    try:
-        s.get(NSE_BASE, timeout=REQUEST_TIMEOUT)
-        time.sleep(0.3)
-    except Exception as e:
-        logger.warning(f"NSE session warm-up failed (continuing anyway): {e}")
-    return s
+    global _NSE_SESSION
+    with _NSE_WARMUP_LOCK:
+        if _NSE_SESSION is not None:
+            return _NSE_SESSION
+            
+        s = new_session()
+        s.headers.update(BROWSER_HEADERS)
+        try:
+            s.get(NSE_BASE, timeout=REQUEST_TIMEOUT)
+            time.sleep(0.3)
+        except Exception as e:
+            logger.warning(f"NSE session warm-up failed (continuing anyway): {e}")
+            
+        _NSE_SESSION = s
+        return s
+
+def _clear_nse_session():
+    global _NSE_SESSION
+    with _NSE_WARMUP_LOCK:
+        _NSE_SESSION = None
 
 
 def _fetch_nse_json(path: str, from_date: datetime.date, to_date: datetime.date, referer: str) -> Dict:
@@ -618,6 +633,9 @@ def _fetch_nse_json(path: str, from_date: datetime.date, to_date: datetime.date,
             headers={"Referer": referer},
             timeout=REQUEST_TIMEOUT,
         )
+        
+        if resp.status_code in (401, 403):
+            _clear_nse_session()
 
         resp.raise_for_status()
 
@@ -753,6 +771,8 @@ def fetch_nse_press_releases(from_date: datetime.date, to_date: datetime.date) -
             if rows and not notices:
                 error = _log_unknown_shape("NSE Press Releases", rows)
         else:
+            if resp.status_code in (401, 403):
+                _clear_nse_session()
             error = f"NSE press releases API returned status {resp.status_code}"
     except Exception as e:
         logger.exception("NSE press release fetch failed")
@@ -1228,6 +1248,9 @@ def fetch_nse_corporate_actions(from_date: datetime.date,
             },
             timeout=REQUEST_TIMEOUT,
         )
+        
+        if response.status_code in (401, 403):
+            _clear_nse_session()
 
         response.raise_for_status()
 
