@@ -207,7 +207,7 @@
             useEffect(() => {
                 const id = setInterval(() => {
                     loadData(false);
-                }, 60000);
+                }, 720000);
                 return () => clearInterval(id);
             }, [appliedDateRange.fromDate, appliedDateRange.toDate]);
 
