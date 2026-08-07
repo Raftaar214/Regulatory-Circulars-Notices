@@ -192,14 +192,22 @@ def _load_summaries():
     global _SUMMARIES
     if supabase_client:
         try:
-            response = supabase_client.table("summaries").select("*").execute()
-            for row in response.data:
-                _SUMMARIES[row["id"]] = {
-                    "summary": row["summary"],
-                    "generated_at": row["generated_at"],
-                    "model": row["model"],
-                    "title": row.get("title", "")
-                }
+            offset = 0
+            limit = 1000
+            while True:
+                response = supabase_client.table("summaries").select("*").range(offset, offset + limit - 1).execute()
+                if not response.data:
+                    break
+                for row in response.data:
+                    _SUMMARIES[row["id"]] = {
+                        "summary": row["summary"],
+                        "generated_at": row["generated_at"],
+                        "model": row["model"],
+                        "title": row.get("title", "")
+                    }
+                if len(response.data) < limit:
+                    break
+                offset += limit
             logger.info(f"Loaded {len(_SUMMARIES)} summaries from Supabase.")
         except Exception as e:
             logger.error(f"Failed to load summaries from Supabase: {e}")
@@ -207,26 +215,29 @@ def _load_summaries():
         logger.info("Supabase not configured, summaries will only live in RAM.")
 
 
-def _save_summaries():
+def _save_summaries(new_records: Optional[List[Dict]] = None):
     if not supabase_client:
         return
     try:
-        records = []
-        with SUMMARIES_LOCK:
-            for k, v in _SUMMARIES.items():
-                records.append({
-                    "id": k,
-                    "summary": v["summary"],
-                    "generated_at": v["generated_at"],
-                    "model": v["model"],
-                    "title": v.get("title", "")
-                })
+        if new_records is not None:
+            records = new_records
+        else:
+            records = []
+            with SUMMARIES_LOCK:
+                for k, v in _SUMMARIES.items():
+                    records.append({
+                        "id": k,
+                        "summary": v["summary"],
+                        "generated_at": v["generated_at"],
+                        "model": v["model"],
+                        "title": v.get("title", "")
+                    })
         
         # Batch upsert to Supabase
-        for i in range(0, len(records), 500):
-            supabase_client.table("summaries").upsert(records[i:i+500]).execute()
+        for i in range(0, len(records), 100):
+            supabase_client.table("summaries").upsert(records[i:i+100]).execute()
             
-        logger.info("Summaries saved to Supabase (%d total).", len(_SUMMARIES))
+        logger.info("Summaries saved to Supabase (saved %d items, %d total).", len(records), len(_SUMMARIES))
     except Exception as e:
         logger.exception("Failed to save summaries to Supabase: %s", e)
 
@@ -436,15 +447,25 @@ def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
         if result:
             now_iso = datetime.datetime.now(IST_TZ).isoformat()
             title_map = {item["id"]: item.get("title", "") for item in deep_chunk}
-            for rid, summ in result.items():
-                _SUMMARIES[rid] = {
-                    "summary": summ,
-                    "model": GEMINI_MODEL,
-                    "generated_at": now_iso,
-                    "title": title_map.get(rid, "")
-                }
+            new_records = []
+            with SUMMARIES_LOCK:
+                for rid, summ in result.items():
+                    entry = {
+                        "summary": summ,
+                        "model": GEMINI_MODEL,
+                        "generated_at": now_iso,
+                        "title": title_map.get(rid, "")
+                    }
+                    _SUMMARIES[rid] = entry
+                    new_records.append({
+                        "id": rid,
+                        "summary": entry["summary"],
+                        "generated_at": entry["generated_at"],
+                        "model": entry["model"],
+                        "title": entry["title"]
+                    })
             generated += len(result)
-            _save_summaries()  # persist after every chunk, not just at the end
+            _save_summaries(new_records)  # persist after every chunk, not just at the end
 
         time.sleep(SUMMARY_CHUNK_DELAY_SECONDS)
 
