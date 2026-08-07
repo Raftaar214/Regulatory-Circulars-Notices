@@ -7,7 +7,7 @@ import time
 import threading
 from typing import List, Dict, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from zoneinfo import ZoneInfo
+IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
 
 import asyncio
 import requests
@@ -27,7 +27,7 @@ except ImportError:
     # a .env file. Add `python-dotenv` to requirements.txt for local dev.
     pass
 
-fetched_at = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
+fetched_at = datetime.datetime.now(IST_TZ).isoformat()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("notices-backend")
@@ -441,7 +441,7 @@ def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
             continue
 
         if result:
-            now_iso = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat()
+            now_iso = datetime.datetime.now(IST_TZ).isoformat()
             for rid, summ in result.items():
                 _SUMMARIES[rid] = {
                     "summary": summ,
@@ -1345,7 +1345,7 @@ LTP_FETCH_SCHEDULE = [
     (7, 50),   # Before 8 AM  — pre-market
     (8, 30),   # 8:30 AM      — pre-open session
     (9, 17),   # 9:17 AM      — just after market open (9:15)
-    (11,25),   # 11:25 AM     — mid-morning    
+    (11, 40),  # 11:40 AM     — mid-morning    
     (15, 40),  # 3:40 PM      — just after market close (3:30)
     (18, 0),   # 6:00 PM      — end of day
 ]
@@ -1358,7 +1358,7 @@ _LTP_FETCH_LOCK = threading.Lock()
 def _current_ltp_slot() -> Optional[tuple]:
     """Return (today_str, slot_index) for the most recent schedule slot
     that has already passed, or None if no slot has passed yet today."""
-    now = datetime.datetime.now(ZoneInfo("Asia/Kolkata"))
+    now = datetime.datetime.now(IST_TZ)
     today_str = now.strftime("%Y-%m-%d")
     current_minutes = now.hour * 60 + now.minute
 
@@ -1824,7 +1824,7 @@ def _build_dataset(from_date, to_date, force_refresh=False):
                 "to_date": to_date.isoformat(),
                 "version": "2026-07-28-v4-ai-summaries",
                 "fetched_at": datetime.datetime.now(
-                    ZoneInfo("Asia/Kolkata")
+                    IST_TZ
                 ).isoformat(),
             }
 
@@ -1870,7 +1870,7 @@ def get_all_notices(
     fills those in without ever re-summarizing a notice that already has
     one - see `summary_status` in the response for progress."""
     today = datetime.datetime.now(
-    ZoneInfo("Asia/Kolkata")
+    IST_TZ
 ).date()
     to_d = datetime.datetime.fromisoformat(to_date).date() if to_date else today
     from_d = datetime.date.fromisoformat(from_date) if from_date else (to_d - datetime.timedelta(days=30))
@@ -1992,7 +1992,7 @@ def summarize_one(notice_id: str, force: bool = False):
     _SUMMARIES[notice_id] = {
         "summary": summary,
         "model": GEMINI_MODEL,
-        "generated_at": datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+        "generated_at": datetime.datetime.now(IST_TZ).isoformat(),
     }
     _save_summaries()
 
@@ -2009,7 +2009,7 @@ def summarize_one(notice_id: str, force: bool = False):
 # ===========================================================================
 async def _refresh_and_summarize():
     loop = asyncio.get_event_loop()
-    today = datetime.datetime.now(ZoneInfo("Asia/Kolkata")).date()
+    today = datetime.datetime.now(IST_TZ).date()
     from_d = today - datetime.timedelta(days=30)
 
     logger.info("Scheduled cycle: refreshing all sources...")
@@ -2059,7 +2059,7 @@ async def _on_startup():
 def health():
     return {
         "status": "ok",
-        "time": datetime.datetime.now(ZoneInfo("Asia/Kolkata")).isoformat(),
+        "time": datetime.datetime.now(IST_TZ).isoformat(),
         "version": "2026-07-28-v4-ai-summaries",
         "scheduler_enabled": ENABLE_SCHEDULER,
         "refresh_interval_seconds": REFRESH_INTERVAL_SECONDS,
