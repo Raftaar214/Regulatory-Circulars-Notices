@@ -1345,6 +1345,7 @@ LTP_FETCH_SCHEDULE = [
     (7, 50),   # Before 8 AM  — pre-market
     (8, 30),   # 8:30 AM      — pre-open session
     (9, 17),   # 9:17 AM      — just after market open (9:15)
+    (11,25),   # 11:25 AM     — mid-morning    
     (15, 40),  # 3:40 PM      — just after market close (3:30)
     (18, 0),   # 6:00 PM      — end of day
 ]
