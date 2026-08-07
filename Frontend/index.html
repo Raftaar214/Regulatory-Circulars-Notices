@@ -1,48 +1,80 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Regulatory Circulars & Notices - Priority & Summary</title>
-    
+
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
-    
+
     <!-- React & ReactDOM -->
     <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-    
+
     <!-- Babel for JSX -->
     <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    
+
     <!-- Lucide Icons (Vanilla) -->
     <script src="https://unpkg.com/lucide@latest"></script>
-    
+
     <!-- Google Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    
+
     <style>
         body {
             font-family: 'Inter', sans-serif;
             background-color: #f8fafc;
         }
-        .table-container::-webkit-scrollbar { 
-            width: 8px; 
-            height: 8px; 
+
+        .table-container::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
         }
-        .table-container::-webkit-scrollbar-track { 
-            background: #f1f1f1; 
-            border-radius: 4px; 
+
+        .table-container::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 4px;
         }
-        .table-container::-webkit-scrollbar-thumb { 
-            background: #cbd5e1; 
-            border-radius: 4px; 
+
+        .table-container::-webkit-scrollbar-thumb {
+            background: #cbd5e1;
+            border-radius: 4px;
         }
-        .table-container::-webkit-scrollbar-thumb:hover { 
-            background: #94a3b8; 
+
+        .table-container::-webkit-scrollbar-thumb:hover {
+            background: #94a3b8;
+        }
+
+        @keyframes toast-in-out {
+            0% {
+                opacity: 0;
+                transform: translateX(100px);
+            }
+
+            10% {
+                opacity: 1;
+                transform: translateX(0);
+            }
+
+            80% {
+                opacity: 1;
+                transform: translateX(0);
+            }
+
+            100% {
+                opacity: 0;
+                transform: translateX(100px);
+            }
+        }
+
+        .animate-fade-in {
+            animation: toast-in-out 3s ease-in-out forwards;
         }
     </style>
 </head>
+
 <body>
     <div id="root"></div>
 
@@ -53,55 +85,156 @@
         const API_BASE = host === "127.0.0.1" || host === "localhost"
             ? "http://127.0.0.1:8000"
             : "https://regulatory-circulars-notices.onrender.com";
-            
+
         const PAGE_SIZE = 50;
 
         const toISODate = (d) => d.toISOString().slice(0, 10);
         const todayISO = toISODate(new Date());
         const sevenDaysAgoISO = toISODate(new Date(Date.now() - 7 * 24 * 60 * 60 * 1000));
 
-        // Keyword Lists mapped to Regex
-        const P1_WORDS = ['span', 'price scan range', 'extreme loss margin', '\\belm\\b', 'mpor', 'initial margin', 'pre-expiry margin', 'pre expiry margin', 'tender margin', 'additional surveillance', 'position limit', 'market wide position limit', '\\bmwpl\\b', 'conversion', 'reversal', 'calendar spread', 'delta based', 'futures equivalent', 'futeq', 'lot size', 'market lot', 'quantity freeze', 'expiry day', 'ban period', 'risk reduction mode'];
-        const P2_WORDS = ['margin', 'derivatives', 'futures', 'options', 'f&o', 'exclusion of futures', 'contract specification', 'strike', 'settlement', 'due date rate', 'collateral', 'haircut', 'cross margin', 'fpi', 'foreign portfolio', 'surveillance', 'volatility'];
-        const P3_WORDS = ['broker', 'trading member', 'clearing member', 'circular', 'consultation', 'master circular', 'compliance', 'internal audit', 'cyber', 'algo', 'connectivity', 'holiday', 'mock trading'];
-        const DEMOTE_WORDS = ['graded surveillance', '\\bgsm\\b', '\\basm\\b', 'additional surveillance measure', 'enhanced surveillance measure', 'securities under ibc', 'empanel', 'algo provider', 'investor service', 'investor protection fund', 'arbitration', 'grievance', 'cyber security awareness', 'mock trading', 'recovery certificate', 'adjudication order', 'release order', 'listing of', 'bonus issue', 'rights issue', 'stock split', 'change in name'];
+        // ------------------------------------------------------------------
+        // Priority scoring - tuned for a prop desk trading NSE/BSE cash + F&O
+        // and MCX commodities (Nifty/Sensex included). Tiers reflect how
+        // directly a notice changes what you can trade, at what margin, or
+        // at what price - not how "newsworthy" it reads. For example ASM/
+        // GSM/ESM additions are TIER 1 here (they spike margin and restrict
+        // a name immediately), even though a generic reader would treat
+        // them as routine surveillance noise.
+        //
+        // Items that only match IGNORE_CATEGORIES (and nothing relevant)
+        // get NO P1/P2/P3 badge at all - they still appear in the table and
+        // stay filterable by title/body/category, they just aren't marked.
+        // Anything unrecognized by every list below defaults to P3 rather
+        // than disappearing, since a missed keyword is safer to over-show
+        // than to silently hide.
+        // ------------------------------------------------------------------
 
-        const P1_REGEX = new RegExp(`(${P1_WORDS.join('|')})`, 'i');
-        const P2_REGEX = new RegExp(`(${P2_WORDS.join('|')})`, 'i');
-        const P3_REGEX = new RegExp(`(${P3_WORDS.join('|')})`, 'i');
-        const DEMOTE_REGEX = new RegExp(`(${DEMOTE_WORDS.join('|')})`, 'i');
+        // TIER 1 - same-day relevant: changes margin, tradeable names, or price limits right now
+        const TIER1_CATEGORIES = {
+            'Margin & Collateral': ['span', 'extreme loss margin', 'elm', 'initial margin', 'exposure margin', 'additional margin', 'special margin', 'peak margin', 'var margin', 'tender margin', 'delivery margin', 'ad-hoc margin', 'margin requirement', 'margin framework', 'collateral haircut', 'cross margin', 'collateral'],
+            'Surveillance Action (ASM/GSM/ESM)': ['additional surveillance measure', 'asm', 'graded surveillance measure', 'gsm', 'enhanced surveillance measure', 'esm', 'risk reduction mode', 'rrm', 'lt-asm', 'st-asm'],
+            'Position Limits & Ban Period': ['market wide position limit', 'mwpl', 'position limit', 'position limits', 'ban period', 'client position limit'],
+            'Trading Halt / Price Band': ['suspension of trading', 'trading halt', 'circuit filter', 'price band', 'trading restriction', 'trading restrictions'],
+            'F&O Contract Changes': ['adjustment of futures and options', 'contract specification', 'contract specifications', 'lot size', 'quantity freeze', 'strike interval', 'tick size', 'expiry day', 'introduction of futures'],
+            'Commodity Settlement (MCX)': ['due date rate', 'due date rates', 'event based additional surveillance', 'e-asm'],
+        };
+
+        // TIER 2 - relevant this week: shapes what/how you'll trade soon, not urgent today
+        const TIER2_CATEGORIES = {
+            'New Contracts & Index Changes': ['new derivative contract', 'inclusion in nifty', 'exclusion from nifty', 'inclusion in sensex', 'exclusion from sensex', 'reconstitution of', 'index methodology'],
+            'Corporate Actions (pre-adjustment)': ['bonus issue', 'rights issue', 'stock split', 'face value split'],
+            'Clearing & Settlement Calendar': ['settlement calendar', 'settlement schedule'],
+            'Algo & Market Access': ['algorithmic trading', 'algo', 'direct market access', 'dma', 'co-location', 'order to trade ratio', 'api facility'],
+            'FPI & Institutional Flows': ['foreign portfolio investor', 'fpi', 'fii'],
+            'Regulatory Framework': ['sebi regulations', 'consultation paper', 'master circular'],
+        };
+
+        // TIER 3 - background awareness, low urgency
+        const TIER3_CATEGORIES = {
+            'Listings & Filings': ['listing of', 'esop', 'esos'],
+            'Reports & Bulletins': ['bulletin', 'publication', 'speech', 'report'],
+            'Company Clarifications': ['clarification received', 'news about'],
+            'Mock / Test Sessions': ['mock trading', 'mock session'],
+        };
+
+        // Not relevant to trading decisions - shown, but no P1/P2/P3 badge
+        const IGNORE_CATEGORIES = {
+            'Investor Grievance / Education': ['investor education', 'investor awareness', 'investor protection fund', 'arbitration', 'grievance'],
+            'Enforcement / Recovery': ['recovery certificate', 'recovery proceedings', 'adjudication order', 'release order', 'appeal no', 'attachment', 'auction notice', 'front running', 'unregistered'],
+            'Membership / Compliance Admin': ['vapt report', 'software as a service', 'renewal process for registration', 'segmental surrender', 'empanel'],
+            'Corporate Calendar': ['change in name of company', 'agm', 'board meeting', 'change in status of company'],
+            'Investor Caution': ['caution to investors', 'caution for investors'],
+        };
+
+        const IMPACT_WORDS = [
+            'effective immediately', 'with immediate effect', 'mandatory', 'shall come into effect',
+            'applicable from', 'revised', 'increased', 'reduced', 'withdrawn', 'suspended',
+            'restricted', 'banned', 'freeze', 'halted'
+        ];
+
+        const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+        // Highest-scoring category name within one tier's group, plus its
+        // score (0 = nothing in this group matched). Summary matches count
+        // for more than title matches since the AI summary is usually more
+        // explicit than the terse exchange-generated title.
+        const scoreCategoryGroup = (group, title, summary) => {
+            let best = null;
+            let bestScore = 0;
+            Object.entries(group).forEach(([name, words]) => {
+                let score = 0;
+                words.forEach(keyword => {
+                    const regex = new RegExp(`\\b${escapeRegExp(keyword)}\\b`, 'i');
+                    if (regex.test(title)) score += 2;
+                    if (regex.test(summary)) score += 5;
+                });
+                if (score > bestScore) { bestScore = score; best = name; }
+            });
+            return { category: best, score: bestScore };
+        };
+
+        const hasImpactLanguage = (title, summary) => IMPACT_WORDS.some(keyword => {
+            const regex = new RegExp(`\\b${escapeRegExp(keyword)}\\b`, 'i');
+            return regex.test(title) || regex.test(summary);
+        });
 
         // Function to score and tag individual items
         const assignPriority = (item) => {
-            const title = item.title || "";
-            let priority = null;
+            const title = (item.title || "").toLowerCase();
+            const summary = (item.summary || "").toLowerCase();
 
-            if (P1_REGEX.test(title)) priority = 'P1';
-            else if (P2_REGEX.test(title)) priority = 'P2';
-            else if (P3_REGEX.test(title)) priority = 'P3';
+            const ignoreHit = scoreCategoryGroup(IGNORE_CATEGORIES, title, summary);
+            const t1 = scoreCategoryGroup(TIER1_CATEGORIES, title, summary);
+            const t2 = scoreCategoryGroup(TIER2_CATEGORIES, title, summary);
+            const t3 = scoreCategoryGroup(TIER3_CATEGORIES, title, summary);
 
-            // Forced Demotion Rule
-            if (DEMOTE_REGEX.test(title)) {
-                priority = 'P3';
+            const anyRelevantMatch = t1.score > 0 || t2.score > 0 || t3.score > 0;
+
+            // Recognized as not trading-relevant, and nothing relevant also
+            // matched - leave it unmarked instead of forcing a P3 badge.
+            if (ignoreHit.score > 0 && !anyRelevantMatch) {
+                return { ...item, priority: null, category: ignoreHit.category || item.category || 'Administrative' };
             }
 
-            return { ...item, priority };
+            const impactBoost = hasImpactLanguage(title, summary);
+            let priority, category;
+
+            if (t1.score > 0) {
+                priority = 'P1';
+                category = t1.category;
+            } else if (t2.score > 0) {
+                // Urgent phrasing on an otherwise-P2 item earns it a P1 -
+                // e.g. a settlement-calendar change that's "effective immediately".
+                priority = impactBoost ? 'P1' : 'P2';
+                category = t2.category;
+            } else if (t3.score > 0) {
+                priority = impactBoost ? 'P2' : 'P3';
+                category = t3.category;
+            } else {
+                // Nothing recognized either way - stay visible at low
+                // priority rather than disappearing, in case the keyword
+                // lists above miss something that turns out to matter.
+                priority = impactBoost ? 'P2' : 'P3';
+                category = item.category || 'Other';
+            }
+
+            return { ...item, priority, category };
         };
 
         // Helper to extract dividend amount
         const extractDividendAmount = (subject) => {
             if (!subject) return "";
-            const match = subject.match(/Rs\.?\s*([\d.]+)/i);
+            const match = subject.match(/(?:Rs|Re)\.?\s*([\d.]+)/i);
             if (match && match[1]) {
                 return `₹${match[1]}`;
             }
-            return subject; 
+            return subject;
         };
-        
+
         const getRowKey = (row) => {
             if (row.id) return row.id;
             if (row.type === 'dividend') return `div-${row.symbol}-${row.ex_date}-${row.subject}`;
-            return `not-${row.body}-${row.date}-${row.title?.substring(0,20)}`;
+            return `not-${row.body}-${row.date}-${row.title?.substring(0, 20)}`;
         };
 
         // Badge color mapping
@@ -119,15 +252,47 @@
         // Safe Icon Component to bridge React and vanilla Lucide without DOM crashes
         const Icon = ({ name, className }) => {
             const spanRef = useRef(null);
-            
+
             useEffect(() => {
                 if (spanRef.current && window.lucide) {
                     spanRef.current.innerHTML = `<i data-lucide="${name}" class="${className || ''}"></i>`;
                     window.lucide.createIcons({ root: spanRef.current });
                 }
             }, [name, className]);
-            
+
             return <span ref={spanRef} style={{ display: 'contents' }}></span>;
+        };
+
+        // Expandable summary with "Read more" / "Show less" toggle
+        const ExpandableSummary = ({ text, maxLines = 2 }) => {
+            const [expanded, setExpanded] = useState(false);
+            const textRef = useRef(null);
+            const [isClamped, setIsClamped] = useState(false);
+
+            useEffect(() => {
+                if (textRef.current) {
+                    setIsClamped(textRef.current.scrollHeight > textRef.current.clientHeight + 1);
+                }
+            }, [text]);
+
+            return (
+                <div className="max-w-sm">
+                    <p
+                        ref={textRef}
+                        className={`text-xs text-slate-700 m-0 p-0 leading-snug ${expanded ? '' : 'line-clamp-2'}`}
+                    >
+                        {text}
+                    </p>
+                    {(isClamped || expanded) && (
+                        <button
+                            onClick={() => setExpanded(prev => !prev)}
+                            className="text-[11px] text-indigo-600 hover:text-indigo-800 font-medium mt-0.5 cursor-pointer"
+                        >
+                            {expanded ? 'Show less' : 'Read more'}
+                        </button>
+                    )}
+                </div>
+            );
         };
 
         const App = () => {
@@ -137,7 +302,7 @@
             const [filterToDate, setFilterToDate] = useState(todayISO);
             const [filterBody, setFilterBody] = useState('All');
             const [filterCategory, setFilterCategory] = useState('All');
-            
+
             const [activeQuickFilter, setActiveQuickFilter] = useState(null);
 
             // Data State
@@ -149,7 +314,13 @@
             const [isRefreshing, setIsRefreshing] = useState(false);
             const [connectionError, setConnectionError] = useState(null);
             const [page, setPage] = useState(1);
-            
+            const [pageInput, setPageInput] = useState('1');
+            const [ltpToast, setLtpToast] = useState(null);
+
+            useEffect(() => {
+                setPageInput(page.toString());
+            }, [page]);
+
             // Per-Row Summary State
             const [rowSummaries, setRowSummaries] = useState({});
 
@@ -178,13 +349,20 @@
                     }
 
                     const json = await response.json();
-                    
+
                     const scoredData = (json.data || []).map(assignPriority);
 
                     setAllData(scoredData);
                     setSourceStatus(json.source_status || {});
                     setFetchedAt(json.fetched_at || null);
                     setSummaryStatus(json.summary_status || null);
+
+                    // Show temporary toast if some LTP fetches failed
+                    const failed = json.ltp_failed_symbols || [];
+                    if (failed.length > 0) {
+                        setLtpToast(failed);
+                        setTimeout(() => setLtpToast(null), 3000);
+                    }
 
                 } catch (error) {
                     console.error("Failed to reach backend:", error);
@@ -197,8 +375,8 @@
                 }
             };
 
-            useEffect(() => { 
-                loadData(false); 
+            useEffect(() => {
+                loadData(false);
             }, [appliedDateRange.fromDate, appliedDateRange.toDate]);
 
             // AI summaries are generated in the background on the server (hourly,
@@ -207,7 +385,7 @@
             useEffect(() => {
                 const id = setInterval(() => {
                     loadData(false);
-                }, 720000);
+                }, 720000); // 12 minutes
                 return () => clearInterval(id);
             }, [appliedDateRange.fromDate, appliedDateRange.toDate]);
 
@@ -251,9 +429,9 @@
                 }
                 return filtered;
             }, [allData, filterTitle, filterBody, filterCategory, activeQuickFilter]);
-            
-            useEffect(() => { 
-                setPage(1); 
+
+            useEffect(() => {
+                setPage(1);
             }, [filterTitle, filterBody, filterCategory, activeQuickFilter]);
 
             const totalPages = Math.max(1, Math.ceil(displayedData.length / PAGE_SIZE));
@@ -271,7 +449,7 @@
                 setAppliedDateRange({ fromDate: sevenDaysAgoISO, toDate: todayISO });
                 setPage(1);
             };
-            
+
             const toggleQuickFilter = (type) => {
                 setActiveQuickFilter(prev => {
                     const newFilter = prev === type ? null : type;
@@ -324,39 +502,100 @@
             const sourceErrors = Object.entries(sourceStatus).filter(([, s]) => s.error);
             const sourceNotes = Object.entries(sourceStatus).filter(([, s]) => s.note && !s.error);
             const totalLive = Object.values(sourceStatus).reduce((sum, s) => sum + (s.count || 0), 0);
-            
+
             const availableCategories = useMemo(() => {
                 return [...new Set(allData.filter(item => item.type !== 'dividend').map(item => item.category))].filter(Boolean).sort();
             }, [allData]);
 
             return (
-                <div className="min-h-screen p-4 md:p-8">
-                    <div className="max-w-[1600px] mx-auto w-full space-y-6">
-                        
+                <div className="h-screen p-2 md:p-4 flex flex-col overflow-hidden bg-slate-50 relative">
+                    <div className="max-w-[1600px] mx-auto w-full flex flex-col h-full gap-2">
+
+                        {/* LTP Error Toast */}
+                        {ltpToast && (
+                            <div className="fixed top-4 right-4 z-50 animate-fade-in">
+                                <div className="bg-red-600 text-white px-3 py-1.5 rounded-lg shadow-lg max-w-xs text-xs leading-relaxed">
+                                    <div className="flex items-start gap-2">
+                                        <Icon name="alert-circle" className="w-4 h-4 shrink-0 mt-0.5" />
+                                        <div>
+                                            <p className="font-semibold mb-0.5">LTP fetch failed</p>
+                                            <p className="opacity-90">{ltpToast.join(', ')} — using last known price</p>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
                         {/* Header */}
-                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                            <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4">
-                                <div>
-                                    <h1 className="text-2xl font-bold text-slate-800 flex items-center gap-2">
-                                        {activeQuickFilter === 'dividend' ? (
-                                            <Icon name="banknote" className="w-6 h-6 text-emerald-600" />
-                                        ) : (
-                                            <Icon name="scroll-text" className="w-6 h-6 text-indigo-600" />
-                                        )}
-                                        {activeQuickFilter === 'dividend' ? 'NSE Corporate Actions – Dividends' : 'Regulatory Notices'}
-                                    </h1>
-                                    <p className="text-slate-500 mt-1">
-                                        {activeQuickFilter === 'dividend' 
-                                            ? 'Latest dividend announcements sorted by Ex-Date.' 
-                                            : 'Live circulars and notices scored by priority relevance.'}
-                                    </p>
+                        <div className="bg-white py-1.5 px-3 rounded-lg shadow-sm border border-slate-200 flex-shrink-0">
+                            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-1">
+                                <div className="flex items-center gap-4">
+                                    <div>
+                                        <h1 className="text-base font-bold text-slate-800 flex items-center gap-1.5">
+                                            {activeQuickFilter === 'dividend' ? (
+                                                <Icon name="banknote" className="w-4 h-4 text-emerald-600" />
+                                            ) : (
+                                                <Icon name="scroll-text" className="w-4 h-4 text-indigo-600" />
+                                            )}
+                                            {activeQuickFilter === 'dividend' ? 'NSE Corporate Actions – Dividends' : 'Regulatory Notices'}
+                                        </h1>
+                                        <p className="text-slate-500 text-xs mt-0.5">
+                                            {activeQuickFilter === 'dividend'
+                                                ? 'Latest dividend announcements sorted by Ex-Date.'
+                                                : 'Live circulars and notices scored by priority relevance.'}
+                                        </p>
+                                    </div>
+                                    <div className="hidden md:block w-px h-8 bg-slate-200"></div>
+                                    <div className="flex items-center gap-1.5 flex-wrap">
+                                        <button
+                                            onClick={() => toggleQuickFilter('P1')}
+                                            className={`text-[11px] font-bold px-2.5 rounded-full transition-colors h-[24px] flex items-center ${activeQuickFilter === 'P1'
+                                                ? 'bg-red-600 text-white shadow-sm border border-red-600'
+                                                : 'bg-red-50 text-red-700 hover:bg-red-100 border border-red-200'
+                                                }`}
+                                        >
+                                            P1 (Critical)
+                                        </button>
+
+                                        <button
+                                            onClick={() => toggleQuickFilter('P2')}
+                                            className={`text-[11px] font-bold px-2.5 rounded-full transition-colors h-[24px] flex items-center ${activeQuickFilter === 'P2'
+                                                ? 'bg-amber-500 text-white shadow-sm border border-amber-500'
+                                                : 'bg-amber-50 text-amber-700 hover:bg-amber-100 border border-amber-200'
+                                                }`}
+                                        >
+                                            P2 (High)
+                                        </button>
+
+                                        <button
+                                            onClick={() => toggleQuickFilter('P3')}
+                                            className={`text-[11px] font-bold px-2.5 rounded-full transition-colors h-[24px] flex items-center ${activeQuickFilter === 'P3'
+                                                ? 'bg-blue-600 text-white shadow-sm border border-blue-600'
+                                                : 'bg-blue-50 text-blue-700 hover:bg-blue-100 border border-blue-200'
+                                                }`}
+                                        >
+                                            P3 (Medium)
+                                        </button>
+
+                                        <div className="w-px h-3.5 bg-slate-300 mx-0.5 hidden sm:block"></div>
+
+                                        <button
+                                            onClick={() => toggleQuickFilter('dividend')}
+                                            className={`text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] ${activeQuickFilter === 'dividend'
+                                                ? 'bg-emerald-600 text-white shadow-sm border border-emerald-600'
+                                                : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200'
+                                                }`}
+                                        >
+                                            <Icon name="banknote" className="w-3 h-3" /> Dividend
+                                        </button>
+                                    </div>
                                 </div>
                                 <div className="flex items-center gap-3">
                                     <span className="text-xs text-slate-400 hidden md:inline">Window set by From/To Date below</span>
                                     <button
                                         onClick={() => loadData(true)}
                                         disabled={isRefreshing}
-                                        className="bg-[#0a0a2a] hover:bg-[#1a1a4a] disabled:opacity-60 text-white font-medium py-2 px-4 rounded-lg shadow-md transition-colors flex items-center gap-2 text-sm"
+                                        className="bg-[#0a0a2a] hover:bg-[#1a1a4a] disabled:opacity-60 text-white font-medium py-1.5 px-3 rounded-lg shadow-md transition-colors flex items-center gap-1.5 text-xs"
                                     >
                                         <Icon name="refresh-cw" className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
                                         {isRefreshing ? 'Refreshing…' : 'Refresh Live Data'}
@@ -365,14 +604,14 @@
                             </div>
 
                             {connectionError && (
-                                <div className="mt-4 p-3 bg-red-50 border border-red-200 text-red-700 rounded-lg flex items-start gap-3 text-sm">
+                                <div className="mt-2 p-2 bg-red-50 border border-red-200 text-red-700 rounded-lg flex items-start gap-2 text-xs">
                                     <Icon name="wifi-off" className="w-5 h-5 flex-shrink-0 mt-0.5" />
                                     <p>{connectionError}</p>
                                 </div>
                             )}
 
                             {!connectionError && sourceErrors && sourceErrors.length > 0 && (
-                                <div className="mt-4 p-3 bg-amber-50 border border-amber-200 text-amber-700 rounded-lg flex items-start gap-3 text-sm">
+                                <div className="mt-2 p-2 bg-amber-50 border border-amber-200 text-amber-700 rounded-lg flex items-start gap-2 text-xs">
                                     <Icon name="alert-triangle" className="w-5 h-5 flex-shrink-0 mt-0.5" />
                                     <div className="space-y-1">
                                         <p className="font-semibold">{sourceErrors.length} source{sourceErrors.length > 1 ? 's' : ''} returned no live data:</p>
@@ -386,7 +625,7 @@
                             )}
 
                             {!connectionError && sourceNotes && sourceNotes.length > 0 && (
-                                <div className="mt-4 p-3 bg-sky-50 border border-sky-200 text-sky-700 rounded-lg flex items-start gap-3 text-sm">
+                                <div className="mt-2 p-2 bg-sky-50 border border-sky-200 text-sky-700 rounded-lg flex items-start gap-2 text-xs">
                                     <Icon name="info" className="w-5 h-5 flex-shrink-0 mt-0.5" />
                                     <div className="space-y-1">
                                         {sourceNotes.map(([name, s]) => (
@@ -397,173 +636,125 @@
                             )}
 
                             {!connectionError && !isLoading && (
-                                <p className="mt-4 text-xs text-slate-400">
+                                <p className="mt-1 text-[11px] text-slate-400">
                                     {totalLive} live rows fetched{fetchedAt ? ` • last updated ${new Date(fetchedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}` : ''}
-                                    {summaryStatus && summaryStatus.model ? ` • AI summaries: ${summaryStatus.generated}/${summaryStatus.generated + summaryStatus.pending} generated (${summaryStatus.model})` : ''}
-                                    {summaryStatus && !summaryStatus.model ? ` • AI summaries disabled (no GEMINI_API_KEY on the backend)` : ''}
+                                    {summaryStatus && summaryStatus.model ? ` • AI summaries: ${summaryStatus.generated}/${summaryStatus.generated + summaryStatus.pending}` : ''}
                                 </p>
                             )}
                         </div>
 
                         {/* Filters */}
-                        <div className="bg-white p-6 rounded-xl shadow-sm border border-slate-200">
-                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4 items-end">
-                                <div className="space-y-1 lg:col-span-1">
-                                    <label className="text-sm font-semibold text-slate-700 block">Title</label>
+                        <div className="bg-white py-2 px-3 rounded-lg shadow-sm border border-slate-200 flex-shrink-0">
+                            <div className="flex flex-wrap items-end gap-2">
+                                <div className="w-[200px]">
                                     <input
                                         type="text"
                                         placeholder="Enter Title"
-                                        className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all placeholder:text-slate-400"
+                                        className="w-full px-2 py-1 text-sm border border-slate-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all placeholder:text-slate-400 h-[30px]"
                                         value={filterTitle}
                                         onChange={(e) => setFilterTitle(e.target.value)}
                                         onKeyDown={(e) => e.key === 'Enter' && handleFilter()}
                                     />
                                 </div>
 
-                                <div className="space-y-1">
-                                    <label className="text-sm font-semibold text-slate-700 block">From Date</label>
+                                <div className="w-[125px]">
                                     <input
                                         type="date"
-                                        className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-slate-700"
+                                        title="From Date"
+                                        className="w-full px-2 py-1 text-sm border border-slate-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-slate-700 h-[30px]"
                                         value={filterFromDate}
                                         onChange={(e) => setFilterFromDate(e.target.value)}
                                     />
                                 </div>
 
-                                <div className="space-y-1">
-                                    <label className="text-sm font-semibold text-slate-700 block">To Date</label>
+                                <div className="w-[125px]">
                                     <input
                                         type="date"
-                                        className="w-full px-4 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-slate-700"
+                                        title="To Date"
+                                        className="w-full px-2 py-1 text-sm border border-slate-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-slate-700 h-[30px]"
                                         value={filterToDate}
                                         onChange={(e) => setFilterToDate(e.target.value)}
                                     />
                                 </div>
 
-                                <div className="grid grid-cols-2 gap-2 lg:col-span-1">
-                                    {activeQuickFilter !== 'dividend' && (
-                                        <>
-                                            <div className="space-y-1">
-                                                <label className="text-sm font-semibold text-slate-700 block">Body</label>
-                                                <select
-                                                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-slate-700 bg-white"
-                                                    value={filterBody}
-                                                    onChange={(e) => setFilterBody(e.target.value)}
-                                                >
-                                                    <option value="All">All</option>
-                                                    <option value="NSE">NSE</option>
-                                                    <option value="NCL">NCL (NSE Clearing)</option>
-                                                    <option value="BSE">BSE</option>
-                                                    <option value="SEBI">SEBI</option>
-                                                    <option value="MCX">MCX</option>
-                                                    <option value="MCXCCL">MCXCCL</option>
-                                                    <option value="IFSCA">IFSCA</option>
-                                                </select>
-                                            </div>
-                                            <div className="space-y-1">
-                                                <label className="text-sm font-semibold text-slate-700 block">Category</label>
-                                                <select
-                                                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-slate-700 bg-white"
-                                                    value={filterCategory}
-                                                    onChange={(e) => setFilterCategory(e.target.value)}
-                                                >
-                                                    <option value="All">All</option>
-                                                    {availableCategories.map(cat => (
-                                                        <option key={cat} value={cat}>{cat}</option>
-                                                    ))}
-                                                </select>
-                                            </div>
-                                        </>
-                                    )}
-                                </div>
+                                {activeQuickFilter !== 'dividend' && (
+                                    <>
+                                        <div className="w-[100px]">
+                                            <select
+                                                title="Body"
+                                                className="w-full px-1 py-1 text-sm border border-slate-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-slate-700 bg-white h-[30px]"
+                                                value={filterBody}
+                                                onChange={(e) => setFilterBody(e.target.value)}
+                                            >
+                                                <option value="All">All Bodies</option>
+                                                <option value="NSE">NSE</option>
+                                                <option value="NCL">NCL (NSE Clearing)</option>
+                                                <option value="BSE">BSE</option>
+                                                <option value="SEBI">SEBI</option>
+                                                <option value="MCX">MCX</option>
+                                                <option value="MCXCCL">MCXCCL</option>
+                                                <option value="IFSCA">IFSCA</option>
+                                            </select>
+                                        </div>
+                                        <div className="w-[130px]">
+                                            <select
+                                                title="Category"
+                                                className="w-full px-1 py-1 text-sm border border-slate-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all text-slate-700 bg-white h-[30px]"
+                                                value={filterCategory}
+                                                onChange={(e) => setFilterCategory(e.target.value)}
+                                            >
+                                                <option value="All">All Categories</option>
+                                                {availableCategories.map(cat => (
+                                                    <option key={cat} value={cat}>{cat}</option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                    </>
+                                )}
 
-                                <div className="flex gap-2 lg:col-span-1">
+                                <div className="flex items-center gap-1.5 h-[30px] shrink-0">
                                     <button
                                         onClick={handleFilter}
-                                        className="flex-1 bg-[#0a0a2a] hover:bg-[#1a1a4a] text-white font-medium py-2 px-6 rounded-lg shadow-md transition-colors flex items-center justify-center gap-2"
+                                        className="bg-[#0a0a2a] hover:bg-[#1a1a4a] text-white font-medium px-3 rounded shadow-sm transition-colors flex items-center justify-center gap-1.5 text-xs h-full"
                                     >
-                                        <Icon name="search" className="w-4 h-4" /> Show
+                                        <Icon name="search" className="w-3.5 h-3.5" /> Show
                                     </button>
                                     <button
                                         onClick={handleReset}
                                         title="Reset Filters"
-                                        className="bg-slate-100 hover:bg-slate-200 text-slate-600 font-medium py-2 px-3 rounded-lg border border-slate-300 transition-colors flex items-center justify-center"
+                                        className="bg-slate-100 hover:bg-slate-200 text-slate-600 font-medium px-2 rounded border border-slate-300 transition-colors flex items-center justify-center h-full"
                                     >
-                                        <Icon name="rotate-ccw" className="w-4 h-4" />
+                                        <Icon name="rotate-ccw" className="w-3.5 h-3.5" />
                                     </button>
                                 </div>
-                            </div>
-                            
-                            <div className="mt-4 pt-4 border-t border-slate-100 flex flex-wrap items-center gap-3">
-                                <button 
-                                    onClick={() => toggleQuickFilter('P1')}
-                                    className={`text-sm font-bold px-4 py-1.5 rounded-full transition-colors ${
-                                        activeQuickFilter === 'P1' 
-                                        ? 'bg-red-600 text-white shadow-sm border border-red-600' 
-                                        : 'bg-red-50 text-red-700 hover:bg-red-100 border border-red-200'
-                                    }`}
-                                >
-                                    P1 (Critical)
-                                </button>
-                                
-                                <button 
-                                    onClick={() => toggleQuickFilter('P2')}
-                                    className={`text-sm font-bold px-4 py-1.5 rounded-full transition-colors ${
-                                        activeQuickFilter === 'P2' 
-                                        ? 'bg-amber-500 text-white shadow-sm border border-amber-500' 
-                                        : 'bg-amber-50 text-amber-700 hover:bg-amber-100 border border-amber-200'
-                                    }`}
-                                >
-                                    P2 (High)
-                                </button>
-                                
-                                <button 
-                                    onClick={() => toggleQuickFilter('P3')}
-                                    className={`text-sm font-bold px-4 py-1.5 rounded-full transition-colors ${
-                                        activeQuickFilter === 'P3' 
-                                        ? 'bg-blue-600 text-white shadow-sm border border-blue-600' 
-                                        : 'bg-blue-50 text-blue-700 hover:bg-blue-100 border border-blue-200'
-                                    }`}
-                                >
-                                    P3 (Medium)
-                                </button>
 
-                                <div className="w-px h-5 bg-slate-300 mx-1"></div>
-                                
-                                <button 
-                                    onClick={() => toggleQuickFilter('dividend')}
-                                    className={`text-sm font-medium px-4 py-1.5 rounded-full transition-colors flex items-center gap-1.5 ${
-                                        activeQuickFilter === 'dividend'
-                                        ? 'bg-emerald-600 text-white shadow-sm border border-emerald-600'
-                                        : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200'
-                                    }`}
-                                >
-                                    <Icon name="banknote" className="w-3.5 h-3.5" /> Dividend
-                                </button>
+
                             </div>
                         </div>
 
                         {/* Data Tables */}
-                        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                        <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col flex-1 min-h-0">
                             {activeQuickFilter === 'dividend' ? (
-                                <div className="overflow-x-auto table-container">
-                                    <table className="w-full text-left border-collapse">
-                                        <thead>
-                                            <tr className="bg-slate-50 border-b border-slate-200 text-slate-700">
-                                                <th className="px-6 py-4 font-semibold text-sm whitespace-nowrap">Symbol</th>
-                                                <th className="px-6 py-4 font-semibold text-sm whitespace-nowrap">Company</th>
-                                                <th className="px-6 py-4 font-semibold text-sm whitespace-nowrap">Dividend</th>
-                                                <th className="px-6 py-4 font-semibold text-sm whitespace-nowrap">Ex Date</th>
-                                                <th className="px-6 py-4 font-semibold text-sm whitespace-nowrap">Record Date</th>
-                                                <th className="px-6 py-4 font-semibold text-sm whitespace-nowrap">Face Value</th>
-                                                <th className="px-6 py-4 font-semibold text-sm min-w-[250px]">Summary</th>
-                                                <th className="px-6 py-4 font-semibold text-sm text-center whitespace-nowrap">Document</th>
+                                <div className="overflow-auto flex-1 table-container">
+                                    <table className="w-full text-left border-collapse relative">
+                                        <thead className="sticky top-0 z-10 bg-slate-50 shadow-[0_1px_0_0_#e2e8f0]">
+                                            <tr className="text-slate-700">
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Symbol</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Company</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Dividend</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">LTP</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Div %</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Ex Date</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Record Date</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Face Value</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm min-w-[250px]">Summary</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm text-center whitespace-nowrap">Document</th>
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-200">
                                             {isLoading ? (
                                                 <tr>
-                                                    <td colSpan="8" className="px-6 py-16 text-center text-slate-500">
+                                                    <td colSpan="10" className="px-6 py-16 text-center text-slate-500">
                                                         <div className="flex flex-col items-center justify-center space-y-3">
                                                             <Icon name="loader-2" className="w-8 h-8 text-indigo-600 animate-spin" />
                                                             <p className="text-base font-medium">Fetching live circulars and notices…</p>
@@ -575,22 +766,33 @@
                                                     const rowKey = getRowKey(row);
                                                     const summaryState = rowSummaries[rowKey];
                                                     const effectiveSummary = summaryState?.text ?? row.summary;
-                                                    
+
                                                     return (
                                                         <tr key={rowKey} className="hover:bg-slate-50 transition-colors group">
-                                                            <td className="px-6 py-4 text-sm font-medium text-slate-800">{row.symbol}</td>
-                                                            <td className="px-6 py-4 text-sm text-slate-600">{row.company}</td>
-                                                            <td className="px-6 py-4 text-sm font-medium text-slate-800">{extractDividendAmount(row.subject)}</td>
-                                                            <td className="px-6 py-4 text-sm text-slate-600">{row.ex_date}</td>
-                                                            <td className="px-6 py-4 text-sm text-slate-600">{row.record_date}</td>
-                                                            <td className="px-6 py-4 text-sm text-slate-600">{row.face_value}</td>
-                                                            <td className="px-6 py-4">
+                                                            <td className="px-3 py-1.5 text-sm font-medium text-slate-800">{row.symbol}</td>
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600">{row.company}</td>
+                                                            <td className="px-3 py-1.5 text-sm font-medium text-slate-800">{extractDividendAmount(row.subject)}</td>
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600 whitespace-nowrap">
+                                                                {row.ltp != null ? `₹${Number(row.ltp).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : <span className="text-slate-400 italic">—</span>}
+                                                            </td>
+                                                            <td className="px-3 py-1.5 text-sm font-semibold whitespace-nowrap">
+                                                                {row.dividend_pct != null ? (
+                                                                    <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-bold ${row.dividend_pct >= 2
+                                                                        ? 'bg-emerald-100 text-emerald-700 border border-emerald-200'
+                                                                        : row.dividend_pct >= 1
+                                                                            ? 'bg-amber-100 text-amber-700 border border-amber-200'
+                                                                            : 'bg-slate-100 text-slate-700 border border-slate-200'
+                                                                        }`}>
+                                                                        {row.dividend_pct}%
+                                                                    </span>
+                                                                ) : <span className="text-slate-400 italic">—</span>}
+                                                            </td>
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600">{row.ex_date}</td>
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600">{row.record_date}</td>
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600">{row.face_value}</td>
+                                                            <td className="px-3 py-1.5">
                                                                 {effectiveSummary ? (
-                                                                    <div className="flex flex-col items-start gap-1">
-                                                                        <p className="text-xs text-slate-700 leading-relaxed max-w-sm">
-                                                                            {effectiveSummary}
-                                                                        </p>
-                                                                    </div>
+                                                                    <ExpandableSummary text={effectiveSummary} />
                                                                 ) : summaryState?.loading ? (
                                                                     <span className="text-xs text-slate-400 flex items-center gap-1.5">
                                                                         <Icon name="loader-2" className="w-3.5 h-3.5 animate-spin" /> Generating...
@@ -605,7 +807,7 @@
                                                                     </div>
                                                                 )}
                                                             </td>
-                                                            <td className="px-6 py-4 text-center">
+                                                            <td className="px-3 py-1.5 text-center">
                                                                 <a
                                                                     href={row.link}
                                                                     target="_blank"
@@ -621,7 +823,7 @@
                                                 })
                                             ) : (
                                                 <tr>
-                                                    <td colSpan="8" className="px-6 py-12 text-center text-slate-500">
+                                                    <td colSpan="10" className="px-6 py-12 text-center text-slate-500">
                                                         <div className="flex flex-col items-center justify-center">
                                                             <Icon name="search-x" className="w-10 h-10 text-slate-300 mb-3" />
                                                             <p className="text-base font-medium">No dividend records found</p>
@@ -633,16 +835,16 @@
                                     </table>
                                 </div>
                             ) : (
-                                <div className="overflow-x-auto table-container">
-                                    <table className="w-full text-left border-collapse">
-                                        <thead>
-                                            <tr className="bg-slate-50 border-b border-slate-200 text-slate-700">
-                                                <th className="px-6 py-4 font-semibold text-sm whitespace-nowrap">Regulatory Body</th>
-                                                <th className="px-6 py-4 font-semibold text-sm whitespace-nowrap">Date</th>
-                                                <th className="px-6 py-4 font-semibold text-sm whitespace-nowrap">Category</th>
-                                                <th className="px-6 py-4 font-semibold text-sm min-w-[300px]">Title</th>
-                                                <th className="px-6 py-4 font-semibold text-sm min-w-[250px]">Summary</th>
-                                                <th className="px-6 py-4 font-semibold text-sm text-center whitespace-nowrap">Document</th>
+                                <div className="overflow-auto flex-1 table-container">
+                                    <table className="w-full text-left border-collapse relative">
+                                        <thead className="sticky top-0 z-10 bg-slate-50 shadow-[0_1px_0_0_#e2e8f0]">
+                                            <tr className="text-slate-700">
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Regulatory Body</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Date</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Category</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm min-w-[300px]">Title</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm min-w-[250px]">Summary</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm text-center whitespace-nowrap">Document</th>
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-200">
@@ -663,38 +865,36 @@
 
                                                     return (
                                                         <tr key={rowKey} className="hover:bg-slate-50 transition-colors group">
-                                                            <td className="px-6 py-4">
+                                                            <td className="px-3 py-1.5">
                                                                 <span className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border ${bodyBadgeClass(row.body)}`}>
                                                                     {row.body}
                                                                 </span>
                                                             </td>
-                                                            <td className="px-6 py-4 text-sm text-slate-600 whitespace-nowrap">
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600 whitespace-nowrap">
                                                                 {row.date ? new Date(row.date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : ''}
                                                             </td>
-                                                            <td className="px-6 py-4">
+                                                            <td className="px-3 py-1.5">
                                                                 <span className="text-sm text-slate-600">{row.category}</span>
                                                             </td>
-                                                            <td className="px-6 py-4">
+                                                            <td className="px-3 py-1.5">
                                                                 <div className="flex items-center gap-2">
                                                                     {row.priority && (
                                                                         <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider shrink-0
-                                                                            ${row.priority === 'P1' ? 'bg-red-100 text-red-700 border border-red-200' : 
-                                                                              row.priority === 'P2' ? 'bg-amber-100 text-amber-700 border border-amber-200' : 
-                                                                              'bg-blue-100 text-blue-700 border border-blue-200'}`}
+                                                                            ${row.priority === 'P1' ? 'bg-red-100 text-red-700 border border-red-200' :
+                                                                                row.priority === 'P2' ? 'bg-amber-100 text-amber-700 border border-amber-200' :
+                                                                                    'bg-blue-100 text-blue-700 border border-blue-200'}`}
                                                                         >
                                                                             {row.priority}
                                                                         </span>
                                                                     )}
-                                                                    <p className="text-sm font-medium text-slate-800 line-clamp-2" title={cleanTitle(row.title)}>
+                                                                    <p className="text-sm font-medium text-slate-800 line-clamp-2 leading-snug m-0 p-0" title={cleanTitle(row.title)}>
                                                                         {cleanTitle(row.title)}
                                                                     </p>
                                                                 </div>
                                                             </td>
-                                                            <td className="px-6 py-4">
+                                                            <td className="px-3 py-1.5">
                                                                 {effectiveSummary ? (
-                                                                    <p className="text-xs text-slate-700 leading-relaxed max-w-sm">
-                                                                        {effectiveSummary}
-                                                                    </p>
+                                                                    <ExpandableSummary text={effectiveSummary} />
                                                                 ) : summaryState?.loading ? (
                                                                     <span className="text-xs text-slate-400 flex items-center gap-1.5">
                                                                         <Icon name="loader-2" className="w-3.5 h-3.5 animate-spin" /> Generating...
@@ -707,7 +907,7 @@
                                                                     <span className="text-xs text-slate-400 italic whitespace-nowrap">Summary pending…</span>
                                                                 )}
                                                             </td>
-                                                            <td className="px-6 py-4 text-center">
+                                                            <td className="px-3 py-1.5 text-center">
                                                                 <a
                                                                     href={row.link}
                                                                     target="_blank"
@@ -750,7 +950,30 @@
                                         >
                                             <Icon name="chevron-left" className="w-4 h-4" />
                                         </button>
-                                        <span>Page {page} of {totalPages}</span>
+                                        <span className="flex items-center gap-1.5">
+                                            Page
+                                            <input
+                                                type="text"
+                                                value={pageInput}
+                                                onChange={(e) => {
+                                                    const val = e.target.value;
+                                                    setPageInput(val);
+                                                    if (val !== '') {
+                                                        const num = parseInt(val, 10);
+                                                        if (!isNaN(num)) {
+                                                            setPage(Math.min(Math.max(1, num), totalPages));
+                                                        }
+                                                    }
+                                                }}
+                                                onBlur={() => {
+                                                    if (pageInput === '' || isNaN(parseInt(pageInput, 10))) {
+                                                        setPageInput(page.toString());
+                                                    }
+                                                }}
+                                                className="w-16 px-2 py-1 text-center border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none text-sm"
+                                            />
+                                            of {totalPages}
+                                        </span>
                                         <button
                                             onClick={() => setPage(p => Math.min(totalPages, p + 1))}
                                             disabled={page >= totalPages}
@@ -772,4 +995,5 @@
         root.render(<App />);
     </script>
 </body>
+
 </html>

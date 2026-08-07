@@ -1,10 +1,10 @@
 import datetime
-import html
 import json
 import os
 import logging
 import re
 import time
+import threading
 from typing import List, Dict, Optional, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo
@@ -1229,11 +1229,198 @@ def fetch_nse_clearing(from_date: datetime.date, to_date: datetime.date) -> Dict
 from urllib.parse import quote
 
 
+def _extract_dividend_amount(subject: str) -> Optional[float]:
+    """Parse the per-share dividend amount (in ₹) from the subject text.
+    Common formats: 'Rs 125/-', 'Rs.5.50', 'Re 1/-', 'Rs 0.50 Per Share'."""
+    if not subject:
+        return None
+    m = re.search(r'(?:Rs\.?|Re\.?)\s*([\d.]+)', subject, re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+    return None
+
+
+def _fetch_ltp_for_symbols(symbols: List[str]) -> Dict[str, Optional[float]]:
+    """Fetch the Last Traded Price (LTP) from NSE for a list of symbols.
+    Uses the NSE NextApi/GetQuoteApi endpoint which returns data nested
+    under equityResponse[0]. We read buyPrice1 as the effective LTP.
+    Returns {symbol: ltp_float_or_None}."""
+    ltp_map: Dict[str, Optional[float]] = {}
+    if not symbols:
+        return ltp_map
+
+    session = _nse_warmup_session()
+    unique_symbols = list(set(symbols))
+    logger.info("Fetching LTP for %d unique dividend symbols...", len(unique_symbols))
+
+    for sym in unique_symbols:
+        try:
+            resp = session.get(
+                f"{NSE_BASE}/api/NextApi/apiClient/GetQuoteApi",
+                params={
+                    "functionName": "getSymbolData",
+                    "marketType": "N",
+                    "series": "EQ",
+                    "symbol": sym,
+                },
+                headers={"Referer": f"{NSE_BASE}/get-quotes/equity?symbol={sym}"},
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if resp.status_code in (401, 403):
+                _clear_nse_session()
+                session = _nse_warmup_session()
+                resp = session.get(
+                    f"{NSE_BASE}/api/NextApi/apiClient/GetQuoteApi",
+                    params={
+                        "functionName": "getSymbolData",
+                        "marketType": "N",
+                        "series": "EQ",
+                        "symbol": sym,
+                    },
+                    headers={"Referer": f"{NSE_BASE}/get-quotes/equity?symbol={sym}"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                ltp_val = None
+
+                # Response shape:
+                # {"equityResponse": [{
+                #   "orderBook": {"buyPrice1": 13977, "lastPrice": 13978, ...},
+                #   "metaData": {"averagePrice": 13928.12, ...},
+                #   "tradeInfo": {"lastPrice": 13978, ...},
+                #   ...
+                # }]}
+                eq_resp = data.get("equityResponse")
+                if isinstance(eq_resp, list) and len(eq_resp) > 0:
+                    item = eq_resp[0]
+                    order_book = item.get("orderBook") or {}
+                    meta_data = item.get("metaData") or {}
+                    trade_info = item.get("tradeInfo") or {}
+
+                    # Prefer orderBook.lastPrice (most accurate real-time),
+                    # then orderBook.buyPrice1, then tradeInfo.lastPrice,
+                    # then metaData.averagePrice
+                    ltp_val = (
+                        order_book.get("lastPrice")
+                        or order_book.get("buyPrice1")
+                        or trade_info.get("lastPrice")
+                        or meta_data.get("averagePrice")
+                    )
+
+                if ltp_val is not None:
+                    ltp_map[sym] = float(ltp_val)
+                else:
+                    logger.warning("Could not extract LTP for %s from response keys: %s",
+                                   sym, list(data.keys()) if isinstance(data, dict) else type(data))
+            else:
+                logger.warning("LTP fetch for %s returned status %s", sym, resp.status_code)
+
+        except Exception as e:
+            logger.warning("LTP fetch failed for %s: %s", sym, e)
+
+        # Rate-limit courtesy
+        time.sleep(0.15)
+
+    logger.info("LTP fetched: %d/%d symbols resolved.", len(ltp_map), len(unique_symbols))
+    return ltp_map
+
+
+# ---------------------------------------------------------------------------
+# LTP schedule-based fetching
+#
+# Instead of calling the NSE quote API on every refresh (slow, rate-limited),
+# LTP is fetched only at specific times of day.  Between those times, the
+# cached LTP values are served instantly without blocking.
+# ---------------------------------------------------------------------------
+_LTP_CACHE: Dict[str, float] = {}
+
+# (hour, minute) in IST — fetch LTP around these times each day
+LTP_FETCH_SCHEDULE = [
+    (7, 50),   # Before 8 AM  — pre-market
+    (8, 30),   # 8:30 AM      — pre-open session
+    (9, 17),   # 9:17 AM      — just after market open (9:15)
+    (15, 40),  # 3:40 PM      — just after market close (3:30)
+    (18, 0),   # 6:00 PM      — end of day
+]
+
+# Tracks which schedule slot was last served, as (date_str, slot_index)
+_LTP_LAST_SERVED_SLOT: Optional[tuple] = None
+_LTP_FETCH_LOCK = threading.Lock()
+
+
+def _current_ltp_slot() -> Optional[tuple]:
+    """Return (today_str, slot_index) for the most recent schedule slot
+    that has already passed, or None if no slot has passed yet today."""
+    now = datetime.datetime.now(ZoneInfo("Asia/Kolkata"))
+    today_str = now.strftime("%Y-%m-%d")
+    current_minutes = now.hour * 60 + now.minute
+
+    best_slot = None
+    for i, (h, m) in enumerate(LTP_FETCH_SCHEDULE):
+        slot_minutes = h * 60 + m
+        if current_minutes >= slot_minutes:
+            best_slot = (today_str, i)
+
+    return best_slot
+
+
+def _should_fetch_ltp() -> bool:
+    """Check if we've entered a new schedule slot that hasn't been served."""
+    global _LTP_LAST_SERVED_SLOT
+    current = _current_ltp_slot()
+    if current is None:
+        return False
+    if _LTP_LAST_SERVED_SLOT is None:
+        return True
+    return current != _LTP_LAST_SERVED_SLOT
+
+
+def _maybe_fetch_ltp_sync(symbols: List[str]):
+    """Fetch LTPs synchronously if a new schedule slot is due.
+    Otherwise, does nothing (relying on cache)."""
+    global _LTP_LAST_SERVED_SLOT
+
+    if not _should_fetch_ltp():
+        return
+
+    with _LTP_FETCH_LOCK:
+        # Double check inside lock
+        if not _should_fetch_ltp():
+            return
+            
+        unique_syms = list(set(symbols))
+        if not unique_syms:
+            return
+
+        current_slot = _current_ltp_slot()
+        slot_label = f"slot {current_slot}" if current_slot else "unknown"
+        logger.info("Scheduled LTP fetch starting (%s) for %d symbols...", slot_label, len(unique_syms))
+
+        ltp_map = _fetch_ltp_for_symbols(unique_syms)
+
+        # Update cache with fresh values
+        for sym, price in ltp_map.items():
+            _LTP_CACHE[sym] = price
+
+        # Mark this slot as served
+        if current_slot:
+            _LTP_LAST_SERVED_SLOT = current_slot
+
+        logger.info("Scheduled LTP fetch done: %d/%d fresh.", len(ltp_map), len(unique_syms))
+
+
 def fetch_nse_corporate_actions(from_date: datetime.date,
                                 to_date: datetime.date) -> Dict:
 
     notices = []
     error = None
+    ltp_failed_symbols: List[str] = []
 
     try:
         session = _nse_warmup_session()
@@ -1319,13 +1506,39 @@ def fetch_nse_corporate_actions(from_date: datetime.date,
                 "link": link,
             })
 
+        # --- Enrich dividends with LTP (non-blocking outside schedule, sync during schedule) ---
+        if notices:
+            symbols = [n["symbol"] for n in notices if n.get("symbol")]
+
+            # Fetch synchronously if a new schedule slot is due, otherwise skip
+            _maybe_fetch_ltp_sync(symbols)
+
+            # Always enrich from cache instantly (never blocks)
+            for n in notices:
+                sym = n.get("symbol", "")
+                ltp = _LTP_CACHE.get(sym)
+                div_amount = _extract_dividend_amount(n.get("subject", ""))
+
+                n["ltp"] = ltp
+                n["ltp_cached"] = True  # always from cache in this path
+                n["dividend_amount"] = div_amount
+
+                if ltp and div_amount and ltp > 0:
+                    n["dividend_pct"] = round((div_amount / ltp) * 100, 2)
+                else:
+                    n["dividend_pct"] = None
+
+                if ltp is None:
+                    ltp_failed_symbols.append(sym)
+
     except Exception as e:
         logger.exception("Dividend fetch failed")
         error = str(e)
 
     return {
         "data": notices,
-        "error": error
+        "error": error,
+        "ltp_failed_symbols": ltp_failed_symbols,
     }
 # ===========================================================================
 # MCX / MCXCCL - ASP.NET webmethod (backpage.aspx/GetCircularSearch), with a
@@ -1492,8 +1705,6 @@ def fetch_ifsca(from_date: datetime.date, to_date: datetime.date) -> Dict:
     }
 
 from bs4 import BeautifulSoup
-import datetime as dt
-
 
 
 # ===========================================================================
@@ -1600,10 +1811,14 @@ def _build_dataset(from_date, to_date, force_refresh=False):
 
             all_notices.sort(key=lambda x: x["date"], reverse=True)
 
+            # Collect LTP failure info from the dividend source
+            ltp_failed = sources.get("NSE Dividend", {}).get("ltp_failed_symbols", [])
+
             result = {
                 "data": all_notices,
                 "total": len(all_notices),
                 "source_status": status,
+                "ltp_failed_symbols": ltp_failed,
                 "from_date": from_date.isoformat(),
                 "to_date": to_date.isoformat(),
                 "version": "2026-07-28-v4-ai-summaries",
@@ -1732,24 +1947,7 @@ def summaries_status():
     }
 
 
-@app.post("/api/summaries/run-now")
-def run_summaries_now():
-    """Manually kick off a summarization pass over whatever's in the
-    current cache, without waiting for the next hourly cycle. Returns
-    immediately; the pass itself runs in a background thread."""
-    cached = _cache_get("latest_dataset")
-    if not cached:
-        return {"status": "no-data", "message": "No cached notices yet - call /api/notices first."}
-    if not GEMINI_API_KEY:
-        return {"status": "no-key", "message": "GEMINI_API_KEY is not set on the backend."}
 
-    if not _try_start_summary_pass():
-        return {"status": "already-running"}
-
-    threading.Thread(
-        target=_run_summary_pass_guarded, args=(cached.get("data", []),), daemon=True
-    ).start()
-    return {"status": "started"}
 
 
 @app.post("/api/summaries/notice/{notice_id:path}")
@@ -1876,12 +2074,6 @@ def home():
     if os.path.exists(index_path):
         return FileResponse(index_path)
     return HTMLResponse("<h1>✅ Regulatory Notices Dashboard API</h1><p>Backend is running, but index.html was not found.</p>")
-@app.get("/test-dividend")
-def test_dividend():
-    today = datetime.date.today()
-    from_date = today - datetime.timedelta(days=30)
-
-    return fetch_nse_corporate_actions(from_date, today)
 
 if __name__ == "__main__":
     import uvicorn
