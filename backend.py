@@ -106,7 +106,7 @@ BROWSER_HEADERS = {
     "Accept": "application/json, text/plain, */*",
 }
 
-REQUEST_TIMEOUT = 15
+REQUEST_TIMEOUT = 45
 INTER_REQUEST_DELAY = 0.4
 
 app = FastAPI(title="Regulatory Notices Dashboard API")
