@@ -54,7 +54,18 @@ GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMI
 # tripping 429s. Raise these once you're on a paid tier.
 SUMMARY_CHUNK_SIZE = int(os.environ.get("SUMMARY_CHUNK_SIZE", "12"))
 SUMMARY_CHUNK_DELAY_SECONDS = float(os.environ.get("SUMMARY_CHUNK_DELAY_SECONDS", "6"))
-SUMMARIES_FILE = os.environ.get("SUMMARIES_FILE", "summaries.json")
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+supabase_client = None
+
+if SUPABASE_URL and SUPABASE_KEY:
+    try:
+        from supabase import create_client
+        supabase_client = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("Supabase client initialized.")
+    except Exception as e:
+        logger.error(f"Failed to initialize Supabase client: {e}")
 
 # How often the backend re-scrapes every source and looks for notices that
 # still need a summary. Summaries already on disk are never regenerated.
@@ -116,83 +127,49 @@ import threading
 
 _CACHE: Dict[str, Dict] = {}
 
-CACHE_FILE = "cache.json"
-
 CACHE_LOCK = threading.Lock()
 CACHE_REFRESHING = False
 
-
 def _cache_get(key: str):
-    """Return cached data if it has not expired."""
-
+    """Return cached data from Supabase if available."""
+    if supabase_client:
+        try:
+            response = supabase_client.table("cache").select("*").eq("key", key).execute()
+            if response.data and len(response.data) > 0:
+                logger.info("Serving cached dataset from Supabase")
+                return response.data[0]["data"]
+        except Exception as e:
+            logger.error(f"Failed to get cache from Supabase: {e}")
+    
+    # Fallback to RAM
     entry = _CACHE.get(key)
-
-    # If RAM cache is empty, try loading cache.json
-    if entry is None:
-        _load_cache_file()
-        entry = _CACHE.get(key)
-
-    if not entry:
-        return None
-
-    logger.info("Serving cached dataset")
-    return entry["data"]
+    if entry:
+        logger.info("Serving cached dataset from RAM")
+        return entry["data"]
+    return None
 
 
 def _cache_set(key: str, data):
-    """Store cache in RAM and on disk."""
-
+    """Store cache in Supabase (and RAM fallback)."""
     _CACHE.clear()
-
     _CACHE[key] = {
         "data": data,
         "ts": time.time(),
     }
-
-    _save_cache_file()
-
-    logger.info("Cache updated successfully.")
-
-
-def _save_cache_file():
-    """Save RAM cache to cache.json."""
-
-    try:
-
-        tmp = CACHE_FILE + ".tmp"
-
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_CACHE, f, ensure_ascii=False)
-
-        os.replace(tmp, CACHE_FILE)
-
-        logger.info("Disk cache saved.")
-
-    except Exception:
-        logger.exception("Failed to save cache.json")
-
-
-def _load_cache_file():
-    """Load cache.json into RAM."""
-
-    global _CACHE
-
-    if not os.path.exists(CACHE_FILE):
-        logger.info("No cache.json found.")
-        return
-
-    try:
-
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            _CACHE = json.load(f)
-
-        logger.info(f"Loaded cache.json ({len(_CACHE)} entries)")
-
-    except Exception:
-        logger.exception("Failed to load cache.json")
-
-# Load cache.json when backend starts
-_load_cache_file()        
+    
+    if supabase_client:
+        try:
+            supabase_client.table("cache").upsert({
+                "key": key,
+                "data": data,
+                "ts": time.time(),
+                "title": f"Regulatory Notices Dataset ({key})"
+            }).execute()
+            logger.info("Cache saved to Supabase.")
+        except Exception as e:
+            logger.error(f"Failed to save cache to Supabase: {e}")
+    else:
+        logger.info("Cache updated in RAM only (Supabase not configured).")
 
 # ---------------------------------------------------------------------------
 # AI summaries store - a separate, permanent JSON file keyed by notice id.
@@ -213,29 +190,45 @@ _SUMMARY_RUN_LOCK = threading.Lock()
 
 def _load_summaries():
     global _SUMMARIES
-
-    if not os.path.exists(SUMMARIES_FILE):
-        logger.info("No summaries.json found - AI summaries start empty.")
-        return
-
-    try:
-        with open(SUMMARIES_FILE, "r", encoding="utf-8") as f:
-            _SUMMARIES = json.load(f)
-        logger.info(f"Loaded summaries.json ({len(_SUMMARIES)} existing summaries)")
-    except Exception:
-        logger.exception("Failed to load summaries.json - starting with an empty summary store.")
+    if supabase_client:
+        try:
+            response = supabase_client.table("summaries").select("*").execute()
+            for row in response.data:
+                _SUMMARIES[row["id"]] = {
+                    "summary": row["summary"],
+                    "generated_at": row["generated_at"],
+                    "model": row["model"],
+                    "title": row.get("title", "")
+                }
+            logger.info(f"Loaded {len(_SUMMARIES)} summaries from Supabase.")
+        except Exception as e:
+            logger.error(f"Failed to load summaries from Supabase: {e}")
+    else:
+        logger.info("Supabase not configured, summaries will only live in RAM.")
 
 
 def _save_summaries():
+    if not supabase_client:
+        return
     try:
-        tmp = SUMMARIES_FILE + ".tmp"
+        records = []
         with SUMMARIES_LOCK:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(_SUMMARIES, f, ensure_ascii=False)
-            os.replace(tmp, SUMMARIES_FILE)
-        logger.info("summaries.json saved (%d total summaries).", len(_SUMMARIES))
-    except Exception:
-        logger.exception("Failed to save summaries.json")
+            for k, v in _SUMMARIES.items():
+                records.append({
+                    "id": k,
+                    "summary": v["summary"],
+                    "generated_at": v["generated_at"],
+                    "model": v["model"],
+                    "title": v.get("title", "")
+                })
+        
+        # Batch upsert to Supabase
+        for i in range(0, len(records), 500):
+            supabase_client.table("summaries").upsert(records[i:i+500]).execute()
+            
+        logger.info("Summaries saved to Supabase (%d total).", len(_SUMMARIES))
+    except Exception as e:
+        logger.exception("Failed to save summaries to Supabase: %s", e)
 
 
 # Load summaries.json when backend starts
@@ -442,11 +435,13 @@ def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
 
         if result:
             now_iso = datetime.datetime.now(IST_TZ).isoformat()
+            title_map = {item["id"]: item.get("title", "") for item in deep_chunk}
             for rid, summ in result.items():
                 _SUMMARIES[rid] = {
                     "summary": summ,
                     "model": GEMINI_MODEL,
                     "generated_at": now_iso,
+                    "title": title_map.get(rid, "")
                 }
             generated += len(result)
             _save_summaries()  # persist after every chunk, not just at the end
@@ -1993,6 +1988,7 @@ def summarize_one(notice_id: str, force: bool = False):
         "summary": summary,
         "model": GEMINI_MODEL,
         "generated_at": datetime.datetime.now(IST_TZ).isoformat(),
+        "title": notice_to_summarize.get("title", ""),
     }
     _save_summaries()
 
