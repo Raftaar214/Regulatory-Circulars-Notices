@@ -921,7 +921,7 @@ def fetch_bse_press_releases(from_date: datetime.date, to_date: datetime.date) -
      return {
         "data": [],
         "error": None,
-        "note": "No press releases published during the selected date range."
+        "note": f"No press releases published during the selected date range. (Debug: got_rows={got_any_rows}, title_found={any_title_found})"
     }
 
     return {
@@ -1666,7 +1666,7 @@ def fetch_ifsca(from_date: datetime.date, to_date: datetime.date) -> Dict:
         session = new_session()
         session.headers.update(BROWSER_HEADERS)
 
-        r = session.get(IFSCA_URL, timeout=REQUEST_TIMEOUT)
+        r = session.get(IFSCA_URL, timeout=90)
         r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "lxml")
