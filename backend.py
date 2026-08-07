@@ -15,7 +15,7 @@ import io
 import pypdf
 
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
@@ -1869,7 +1869,6 @@ def _build_dataset(from_date, to_date, force_refresh=False):
             CACHE_REFRESHING = False
 @app.get("/api/notices")
 def get_all_notices(
-    refresh: bool = Query(False, description="Force a fresh fetch, bypassing the cache"),
     from_date: Optional[str] = Query(None, description="YYYY-MM-DD, defaults to 30 days ago"),
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, defaults to today"),
 ):
@@ -1891,7 +1890,7 @@ def get_all_notices(
     to_d = datetime.datetime.fromisoformat(to_date).date() if to_date else today
     from_d = datetime.date.fromisoformat(from_date) if from_date else (to_d - datetime.timedelta(days=30))
 
-    result = _build_dataset(from_d, to_d, force_refresh=refresh)
+    result = _build_dataset(from_d, to_d, force_refresh=False)
     all_notices = result.get("data", [])
     
     # Filter the notices by the requested date range
@@ -1944,6 +1943,24 @@ def get_all_notices(
             "model": GEMINI_MODEL if GEMINI_API_KEY else None,
         },
     }
+
+@app.post("/api/admin/force-refresh")
+async def admin_force_refresh():
+    """Admin endpoint to manually trigger the full scrape and summarize process, returning any errors."""
+    try:
+        status = await _refresh_and_summarize()
+        errors = {name: s["error"] for name, s in status.items() if s.get("error")}
+        notes = {name: s["note"] for name, s in status.items() if s.get("note") and not s.get("error")}
+        
+        return {
+            "status": "ok",
+            "message": "Manual refresh completed.",
+            "errors": errors if errors else None,
+            "notes": notes if notes else None,
+            "full_status": status
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @app.get("/api/summaries/status")
@@ -2045,31 +2062,48 @@ async def _refresh_and_summarize():
 
     if not _try_start_summary_pass():
         logger.info("Scheduled cycle: a summary pass is already running - skipping.")
-        return
+        return status
 
     logger.info("Scheduled cycle: summarizing any new notices...")
     await loop.run_in_executor(None, _run_summary_pass_guarded, result.get("data", []))
+    
+    return status
 
 
-async def _hourly_job_loop():
+async def _scheduled_job_loop():
     await asyncio.sleep(5)  # let the app finish starting first
+    
+    # Target hours and minutes in IST (8am, 9am, 10am, 3:30pm, 5pm, 11pm)
+    target_times = [(8, 0), (9, 0), (10, 0), (15, 30), (17, 0), (23, 0)]
+    last_run_time = None
+    
     while True:
         try:
-            await _refresh_and_summarize()
+            now = datetime.datetime.now(IST_TZ)
+            current_time = (now.hour, now.minute)
+            
+            # If current time matches one of the target times, and we haven't already run in this minute
+            if current_time in target_times and current_time != last_run_time:
+                logger.info(f"Scheduled time reached: {now.strftime('%H:%M')} IST. Starting refresh.")
+                last_run_time = current_time
+                await _refresh_and_summarize()
+                
         except Exception:
-            logger.exception("Hourly refresh/summarize cycle failed")
-        await asyncio.sleep(REFRESH_INTERVAL_SECONDS)
+            logger.exception("Scheduled refresh/summarize cycle failed")
+            
+        # Check every 30 seconds so we don't miss the minute mark
+        await asyncio.sleep(30)
 
 
 @app.on_event("startup")
 async def _on_startup():
     if ENABLE_SCHEDULER:
         logger.info(
-            "Starting hourly refresh+summarize loop (every %ss).", REFRESH_INTERVAL_SECONDS
+            "Starting scheduled refresh loop (8am, 9am, 10am, 3:30pm, 5pm, 11pm IST)."
         )
-        asyncio.create_task(_hourly_job_loop())
+        asyncio.create_task(_scheduled_job_loop())
     else:
-        logger.info("ENABLE_SCHEDULER=false - hourly auto-refresh is disabled.")
+        logger.info("ENABLE_SCHEDULER=false - scheduled auto-refresh is disabled.")
 
 
 @app.get("/api/health")
