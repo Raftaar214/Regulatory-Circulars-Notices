@@ -328,8 +328,8 @@
                 fromDate: sevenDaysAgoISO, toDate: todayISO
             });
 
-            const loadData = async (forceRefresh = false) => {
-                forceRefresh ? setIsRefreshing(true) : setIsLoading(true);
+            const loadData = async () => {
+                setIsLoading(true);
                 setConnectionError(null);
 
                 try {
@@ -337,10 +337,6 @@
                         from_date: appliedDateRange.fromDate,
                         to_date: appliedDateRange.toDate,
                     });
-
-                    if (forceRefresh) {
-                        params.set("refresh", "true");
-                    }
 
                     const response = await fetch(`${API_BASE}/api/notices?${params.toString()}`);
 
@@ -590,17 +586,7 @@
                                         </button>
                                     </div>
                                 </div>
-                                <div className="flex items-center gap-3">
-                                    <span className="text-xs text-slate-400 hidden md:inline">Window set by From/To Date below</span>
-                                    <button
-                                        onClick={() => loadData(true)}
-                                        disabled={isRefreshing}
-                                        className="bg-[#0a0a2a] hover:bg-[#1a1a4a] disabled:opacity-60 text-white font-medium py-1.5 px-3 rounded-lg shadow-md transition-colors flex items-center gap-1.5 text-xs"
-                                    >
-                                        <Icon name="refresh-cw" className={`w-4 h-4 ${isRefreshing ? 'animate-spin' : ''}`} />
-                                        {isRefreshing ? 'Refreshing…' : 'Refresh Live Data'}
-                                    </button>
-                                </div>
+
                             </div>
 
                             {connectionError && (
@@ -610,30 +596,7 @@
                                 </div>
                             )}
 
-                            {!connectionError && sourceErrors && sourceErrors.length > 0 && (
-                                <div className="mt-2 p-2 bg-amber-50 border border-amber-200 text-amber-700 rounded-lg flex items-start gap-2 text-xs">
-                                    <Icon name="alert-triangle" className="w-5 h-5 flex-shrink-0 mt-0.5" />
-                                    <div className="space-y-1">
-                                        <p className="font-semibold">{sourceErrors.length} source{sourceErrors.length > 1 ? 's' : ''} returned no live data:</p>
-                                        <ul className="list-disc pl-5 space-y-1">
-                                            {sourceErrors.map(([name, s]) => (
-                                                <li key={name}><span className="font-medium">{name}:</span> {s.error}</li>
-                                            ))}
-                                        </ul>
-                                    </div>
-                                </div>
-                            )}
 
-                            {!connectionError && sourceNotes && sourceNotes.length > 0 && (
-                                <div className="mt-2 p-2 bg-sky-50 border border-sky-200 text-sky-700 rounded-lg flex items-start gap-2 text-xs">
-                                    <Icon name="info" className="w-5 h-5 flex-shrink-0 mt-0.5" />
-                                    <div className="space-y-1">
-                                        {sourceNotes.map(([name, s]) => (
-                                            <p key={name}><span className="font-medium">{name}:</span> {s.note}</p>
-                                        ))}
-                                    </div>
-                                </div>
-                            )}
 
                             {!connectionError && !isLoading && (
                                 <p className="mt-1 text-[11px] text-slate-400">
