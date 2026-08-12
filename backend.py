@@ -190,6 +190,7 @@ def _row_to_notice(row: Dict) -> Dict:
     notice["date"] = row.get("date", notice.get("date", ""))
     notice["body"] = row.get("body", notice.get("body", ""))
     notice["type"] = row.get("type", notice.get("type", "notice"))
+    notice["scraped_at"] = row.get("scraped_at")
     return notice
 
 def _notices_upsert(notices: List[Dict]) -> int:
@@ -245,6 +246,17 @@ def _wrap_notices_result(notices: List[Dict], from_date: datetime.date,
             status[src] = {"count": 0, "error": None, "note": None}
         status[src]["count"] += 1
 
+    # Calculate the most recent time any of these notices were scraped/updated in the DB
+    max_scraped = None
+    for n in notices:
+        sa = n.get("scraped_at")
+        if sa:
+            if not max_scraped or sa > max_scraped:
+                max_scraped = sa
+                
+    # Fallback to now if no valid scraped_at found
+    fetched_at = max_scraped if max_scraped else datetime.datetime.now(IST_TZ).isoformat()
+
     return {
         "data": notices,
         "total": len(notices),
@@ -253,7 +265,7 @@ def _wrap_notices_result(notices: List[Dict], from_date: datetime.date,
         "from_date": from_date.isoformat(),
         "to_date": to_date.isoformat(),
         "version": "2026-07-28-v4-ai-summaries",
-        "fetched_at": datetime.datetime.now(IST_TZ).isoformat(),
+        "fetched_at": fetched_at,
     }
 
 # Guards against two summarization passes running at once (one kicked off
@@ -1771,16 +1783,13 @@ def _scrape_fresh(from_date: datetime.date, to_date: datetime.date) -> Dict:
     all_notices.sort(key=lambda x: x.get("date", ""), reverse=True)
     ltp_failed = sources.get("NSE Dividend", {}).get("ltp_failed_symbols", [])
 
-    return {
-        "data": all_notices,
+    result = _wrap_notices_result(all_notices, from_date, to_date)
+    result.update({
         "total": len(all_notices),
         "source_status": status,
         "ltp_failed_symbols": ltp_failed,
-        "from_date": from_iso,
-        "to_date": to_iso,
-        "version": "2026-07-28-v4-ai-summaries",
-        "fetched_at": datetime.datetime.now(IST_TZ).isoformat(),
-    }
+    })
+    return result
 
 
 def _build_dataset(from_date: datetime.date, to_date: datetime.date,
