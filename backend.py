@@ -123,13 +123,12 @@ app.add_middleware(
 # RAM cache — used as a fast in-process layer so page loads don't always
 # need to round-trip Supabase. The persistent source of truth is now the
 # `notices` Supabase table (append-only, deduplicated by id).
-# ---------------------------------------------------------------------------
+
 import threading
-
-
 
 CACHE_LOCK = threading.Lock()
 CACHE_REFRESHING = False
+LAST_REFRESHED_AT: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # Supabase `notices` table helpers  (JSONB hybrid design)
@@ -254,8 +253,14 @@ def _wrap_notices_result(notices: List[Dict], from_date: datetime.date,
             if not max_scraped or sa > max_scraped:
                 max_scraped = sa
                 
-    # Fallback to now if no valid scraped_at found
-    fetched_at = max_scraped if max_scraped else datetime.datetime.now(IST_TZ).isoformat()
+    # Fallback order: Global last refresh time -> Max scraped_at -> Now
+    global LAST_REFRESHED_AT
+    if LAST_REFRESHED_AT:
+        fetched_at = LAST_REFRESHED_AT
+    elif max_scraped:
+        fetched_at = max_scraped
+    else:
+        fetched_at = datetime.datetime.now(IST_TZ).isoformat()
 
     return {
         "data": notices,
@@ -1831,6 +1836,8 @@ def _build_dataset(from_date: datetime.date, to_date: datetime.date,
             logger.info("Building live dataset for %s → %s …",
                         from_date.isoformat(), to_date.isoformat())
             result = _scrape_fresh(from_date, to_date)
+            
+            LAST_REFRESHED_AT = datetime.datetime.now(IST_TZ).isoformat()
 
             # Upsert scraped rows into Supabase (append + dedup by id)
             _notices_upsert(result["data"])
