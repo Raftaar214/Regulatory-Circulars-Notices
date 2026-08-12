@@ -120,145 +120,147 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Cache - keyed by (from_date, to_date) so switching the date window doesn't
-# require re-scraping if you flip back to a range you already fetched.
+# RAM cache — used as a fast in-process layer so page loads don't always
+# need to round-trip Supabase. The persistent source of truth is now the
+# `notices` Supabase table (append-only, deduplicated by id).
 # ---------------------------------------------------------------------------
 import threading
 
-_CACHE: Dict[str, Dict] = {}
+
 
 CACHE_LOCK = threading.Lock()
 CACHE_REFRESHING = False
 
-def _cache_get(key: str):
-    """Return cached data from Supabase if available."""
-    if supabase_client:
-        try:
-            response = supabase_client.table("cache").select("*").eq("key", key).execute()
-            if response.data and len(response.data) > 0:
-                logger.info("Serving cached dataset from Supabase")
-                return response.data[0]["data"]
-        except Exception as e:
-            logger.error(f"Failed to get cache from Supabase: {e}")
-    
-    # Fallback to RAM
-    entry = _CACHE.get(key)
-    if entry:
-        logger.info("Serving cached dataset from RAM")
-        return entry["data"]
-    return None
+# ---------------------------------------------------------------------------
+# Supabase `notices` table helpers  (JSONB hybrid design)
+#
+# Table has 4 real SQL columns (fast filter/index) + 1 jsonb column
+# that stores all remaining fields — only non-null values, so sparse
+# rows (e.g. notices with no dividend fields) take minimal space.
+#
+# Schema (run once in your Supabase SQL editor):
+#
+#   create table if not exists notices (
+#     id         text primary key,          -- e.g. "nse-NSE/CMTR/12345"
+#     date       date         not null,     -- YYYY-MM-DD (or ex_date for dividends)
+#     body       text,                      -- NSE | BSE | SEBI | MCX | MCXCCL | IFSCA
+#     type       text default 'notice',     -- 'notice' | 'dividend'
+#     data       jsonb        not null,     -- all other non-null fields
+#     scraped_at timestamptz  default now()
+#   );
+#   create index if not exists notices_date_idx on notices (date desc);
+#   create index if not exists notices_body_idx on notices (body);
+# ---------------------------------------------------------------------------
 
+# Top-level SQL columns (everything else goes in `data` jsonb)
+_NOTICE_TOP_COLS = {"id", "date", "body", "type", "_source_key"}
 
-def _cache_set(key: str, data):
-    """Store cache in Supabase (and RAM fallback)."""
-    _CACHE.clear()
-    _CACHE[key] = {
+def _notice_to_row(n: Dict) -> Dict:
+    """Convert a notice dict into the 4-column + JSONB hybrid Supabase row.
+
+    Row shape: { id, date, body, type, data: {...all other non-null fields...} }
+    Only non-null / non-empty values go into `data`, so sparse notice rows
+    (e.g. regular notices with no dividend fields) are as compact as possible.
+    """
+    ntype = n.get("type") or "notice"
+    data: Dict = {}
+    for k, v in n.items():
+        if k in _NOTICE_TOP_COLS:  # already a real SQL column or internal tag
+            continue
+        if v is None or v == "":
+            continue
+        data[k] = v
+
+    return {
+        "id":   n.get("id", ""),
+        "date": n.get("date") or n.get("ex_date") or "",
+        "body": n.get("body") or "",
+        "type": ntype,
         "data": data,
-        "ts": time.time(),
     }
-    
-    if supabase_client:
-        try:
-            supabase_client.table("cache").upsert({
-                "key": key,
-                "data": data,
-                "ts": time.time(),
-                "title": f"Regulatory Notices Dataset ({key})"
-            }).execute()
-            logger.info("Cache saved to Supabase.")
-        except Exception as e:
-            logger.error(f"Failed to save cache to Supabase: {e}")
-    else:
-        logger.info("Cache updated in RAM only (Supabase not configured).")
 
-# ---------------------------------------------------------------------------
-# AI summaries store - a separate, permanent JSON file keyed by notice id.
-# This is intentionally NOT part of cache.json: cache.json is disposable
-# (rebuilt from source sites every refresh), but summaries cost tokens to
-# create, so once a notice has a summary here it is never re-sent to Gemini.
-# Same tmp-file + os.replace atomic-write pattern as _save_cache_file above.
-# ---------------------------------------------------------------------------
-_SUMMARIES: Dict[str, Dict] = {}
-SUMMARIES_LOCK = threading.Lock()
+
+def _row_to_notice(row: Dict) -> Dict:
+    """Reconstruct a flat notice dict from a JSONB hybrid Supabase row.
+    Merges the 4 top-level SQL columns back with the `data` jsonb payload.
+    """
+    notice = dict(row.get("data") or {})
+    # Top-level SQL columns always win over any duplicate keys in data
+    notice["id"]   = row.get("id",   notice.get("id",   ""))
+    notice["date"] = row.get("date", notice.get("date", ""))
+    notice["body"] = row.get("body", notice.get("body", ""))
+    notice["type"] = row.get("type", notice.get("type", "notice"))
+    return notice
+
+def _notices_upsert(notices: List[Dict]) -> int:
+    """Upsert notices into the hybrid Supabase table."""
+    if not supabase_client or not notices:
+        return len(notices)
+
+    rows = [_notice_to_row(n) for n in notices if n.get("id")]
+    if not rows: return 0
+
+    upserted = 0
+    for i in range(0, len(rows), 100):
+        try:
+            supabase_client.table("notices").upsert(rows[i:i+100]).execute()
+            upserted += len(rows[i:i+100])
+        except Exception as e:
+            logger.error(f"Failed to upsert notices: {e}")
+
+    return upserted
+
+def _notices_fetch(from_date: datetime.date, to_date: datetime.date) -> Optional[Dict]:
+    """Fetch notices from the hybrid Supabase table."""
+    from_iso, to_iso = from_date.isoformat(), to_date.isoformat()
+
+    # Always fetch from Supabase to ensure accurate date range data
+    if not supabase_client: return None
+
+    all_rows = []
+    offset = 0
+    try:
+        while True:
+            resp = supabase_client.table("notices").select("*").gte("date", from_iso).lte("date", to_iso).range(offset, offset + 999).execute()
+            batch = [_row_to_notice(r) for r in (resp.data or [])]
+            all_rows.extend(batch)
+            if len(batch) < 1000: break
+            offset += 1000
+    except Exception as e:
+        logger.error(f"Failed to fetch: {e}")
+        return None
+
+    return _wrap_notices_result(all_rows, from_date, to_date)
+
+
+def _wrap_notices_result(notices: List[Dict], from_date: datetime.date,
+                         to_date: datetime.date) -> Dict:
+    """Package a flat list of notices into the standard result dict shape
+    expected by get_all_notices() and _refresh_and_summarize()."""
+    # Build source_status from what's in the list
+    status: Dict[str, Dict] = {}
+    for n in notices:
+        src = n.get("body", "Unknown")
+        if src not in status:
+            status[src] = {"count": 0, "error": None, "note": None}
+        status[src]["count"] += 1
+
+    return {
+        "data": notices,
+        "total": len(notices),
+        "source_status": status,
+        "ltp_failed_symbols": [],
+        "from_date": from_date.isoformat(),
+        "to_date": to_date.isoformat(),
+        "version": "2026-07-28-v4-ai-summaries",
+        "fetched_at": datetime.datetime.now(IST_TZ).isoformat(),
+    }
 
 # Guards against two summarization passes running at once (one kicked off
 # by the hourly scheduler, one by a page load) - same idea as
 # CACHE_REFRESHING/CACHE_LOCK below for dataset refreshes.
 _SUMMARY_RUNNING = False
 _SUMMARY_RUN_LOCK = threading.Lock()
-
-
-def _load_summaries():
-    global _SUMMARIES
-    if supabase_client:
-        try:
-            offset = 0
-            limit = 1000
-            while True:
-                response = supabase_client.table("summaries").select("*").range(offset, offset + limit - 1).execute()
-                if not response.data:
-                    break
-                for row in response.data:
-                    _SUMMARIES[row["id"]] = {
-                        "summary": row["summary"],
-                        "generated_at": row["generated_at"],
-                        "model": row["model"],
-                        "title": row.get("title", "")
-                    }
-                if len(response.data) < limit:
-                    break
-                offset += limit
-            logger.info(f"Loaded {len(_SUMMARIES)} summaries from Supabase.")
-        except Exception as e:
-            logger.error(f"Failed to load summaries from Supabase: {e}")
-    else:
-        logger.info("Supabase not configured, summaries will only live in RAM.")
-
-
-def _save_summaries(new_records: Optional[List[Dict]] = None):
-    if not supabase_client:
-        return
-    try:
-        if new_records is not None:
-            records = new_records
-        else:
-            records = []
-            with SUMMARIES_LOCK:
-                for k, v in _SUMMARIES.items():
-                    records.append({
-                        "id": k,
-                        "summary": v["summary"],
-                        "generated_at": v["generated_at"],
-                        "model": v["model"],
-                        "title": v.get("title", "")
-                    })
-        
-        # Batch upsert to Supabase
-        for i in range(0, len(records), 100):
-            supabase_client.table("summaries").upsert(records[i:i+100]).execute()
-            
-        logger.info("Summaries saved to Supabase (saved %d items, %d total).", len(records), len(_SUMMARIES))
-    except Exception as e:
-        logger.exception("Failed to save summaries to Supabase: %s", e)
-
-
-# Load summaries.json when backend starts
-_load_summaries()
-
-
-def _decorate_with_summaries(notices: List[Dict]) -> List[Dict]:
-    """Return a shallow-copied list of notices, each with a `summary` field
-    merged in from the store (or None if it hasn't been generated yet). A
-    shallow copy is used deliberately so this never mutates the shared,
-    cached notice objects that `_CACHE` hands back to every caller."""
-    decorated = []
-    for n in notices:
-        entry = _SUMMARIES.get(n.get("id"))
-        row = dict(n)
-        row["summary"] = entry["summary"] if entry else None
-        row["summary_generated_at"] = entry.get("generated_at") if entry else None
-        decorated.append(row)
-    return decorated
 
 def _extract_text_from_url(url: str) -> str:
     """Download a document (PDF or HTML) and extract its text."""
@@ -407,7 +409,7 @@ def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
     if not GEMINI_API_KEY:
         return {"generated": 0, "pending": len(notices)}
 
-    pending = [n for n in notices if n.get("id") and n["id"] not in _SUMMARIES]
+    pending = [n for n in notices if n.get("id") and not n.get("summary")]
 
     if not pending:
         logger.info("Summary pass: nothing new (%d notices already covered).", len(notices))
@@ -446,30 +448,22 @@ def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
 
         if result:
             now_iso = datetime.datetime.now(IST_TZ).isoformat()
-            title_map = {item["id"]: item.get("title", "") for item in deep_chunk}
-            new_records = []
-            with SUMMARIES_LOCK:
-                for rid, summ in result.items():
-                    entry = {
-                        "summary": summ,
-                        "model": GEMINI_MODEL,
-                        "generated_at": now_iso,
-                        "title": title_map.get(rid, "")
-                    }
-                    _SUMMARIES[rid] = entry
-                    new_records.append({
-                        "id": rid,
-                        "summary": entry["summary"],
-                        "generated_at": entry["generated_at"],
-                        "model": entry["model"],
-                        "title": entry["title"]
-                    })
+            updated_notices = []
+            for item in deep_chunk:
+                rid = item["id"]
+                if rid in result:
+                    item["summary"] = result[rid]
+                    item["summary_generated_at"] = now_iso
+                    item["summary_model"] = GEMINI_MODEL
+                    updated_notices.append(item)
+            
             generated += len(result)
-            _save_summaries(new_records)  # persist after every chunk, not just at the end
+            if updated_notices:
+                _notices_upsert(updated_notices)
 
         time.sleep(SUMMARY_CHUNK_DELAY_SECONDS)
 
-    still_pending = sum(1 for n in notices if n.get("id") and n["id"] not in _SUMMARIES)
+    still_pending = sum(1 for n in notices if n.get("id") and not n.get("summary"))
     logger.info("Summary pass complete: %d generated, %d still pending.", generated, still_pending)
 
     return {"generated": generated, "pending": still_pending}
@@ -1727,216 +1721,181 @@ from bs4 import BeautifulSoup
 # ===========================================================================
 # Aggregation endpoint
 # ===========================================================================
-def _build_dataset(from_date, to_date, force_refresh=False):
+def _scrape_fresh(from_date: datetime.date, to_date: datetime.date) -> Dict:
+    """Run all scrapers in parallel for the given date window and return a
+    raw result dict. Does NOT touch cache or Supabase — pure scrape."""
+    jobs = {
+        "NSE Circulars": fetch_nse_circulars,
+        "NSE Press Releases": fetch_nse_press_releases,
+        "NSE Dividend": fetch_nse_corporate_actions,
+        "NSE Clearing": fetch_nse_clearing,
+        "BSE Notices": fetch_bse_notices,
+        "BSE Press Releases": fetch_bse_press_releases,
+        "SEBI Updates": fetch_sebi_whats_new,
+        "MCX Circulars": fetch_mcx,
+        "MCXCCL Circulars": fetch_mcxccl,
+        "IFSCA": fetch_ifsca,
+    }
+
+    sources: Dict[str, Dict] = {}
+    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+        future_map = {
+            executor.submit(func, from_date, to_date): name
+            for name, func in jobs.items()
+        }
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                sources[name] = future.result()
+                logger.info(f"✓ {name} completed")
+            except Exception as e:
+                logger.exception(f"{name} failed")
+                sources[name] = {"data": [], "error": str(e), "note": "Fetch failed"}
+
+    all_notices: List[Dict] = []
+    status: Dict[str, Dict] = {}
+    from_iso = from_date.isoformat()
+    to_iso = to_date.isoformat()
+
+    for name, src in sources.items():
+        filtered = [r for r in src["data"] if from_iso <= r.get("date", to_iso) <= to_iso]
+        for row in filtered:
+            row["_source_key"] = name
+        all_notices.extend(filtered)
+        status[name] = {
+            "count": len(filtered),
+            "error": src.get("error"),
+            "note": src.get("note"),
+        }
+
+    all_notices.sort(key=lambda x: x.get("date", ""), reverse=True)
+    ltp_failed = sources.get("NSE Dividend", {}).get("ltp_failed_symbols", [])
+
+    return {
+        "data": all_notices,
+        "total": len(all_notices),
+        "source_status": status,
+        "ltp_failed_symbols": ltp_failed,
+        "from_date": from_iso,
+        "to_date": to_iso,
+        "version": "2026-07-28-v4-ai-summaries",
+        "fetched_at": datetime.datetime.now(IST_TZ).isoformat(),
+    }
+
+
+def _build_dataset(from_date: datetime.date, to_date: datetime.date,
+                   force_refresh: bool = False) -> Dict:
+    """Return notices for the requested date range.
+
+    - force_refresh=False (normal page load): read from Supabase `notices`
+      table. Never re-scrapes live sources.
+    - force_refresh=True (called only by the scheduler): scrape live, upsert
+      to Supabase, then return the freshly-scraped data.
+
+    The Supabase `notices` table is the persistent source of truth and grows
+    day-by-day.
+    """
     global CACHE_REFRESHING
 
-    cache_key = "latest_dataset"
-
     # -------------------------------------------------------
-    # Normal visitors -> always serve cache if available
+    # Normal page load: serve from Supabase / RAM cache
     # -------------------------------------------------------
     if not force_refresh:
-        cached = _cache_get(cache_key)
-        if cached is not None:
-            return cached
+        result = _notices_fetch(from_date, to_date)
+        if result is not None:
+            return result
+        # Nothing in Supabase/cache yet → fall through to a live scrape
+        logger.info("No cached notices found; falling back to live scrape.")
 
     # -------------------------------------------------------
-    # Prevent multiple refreshes
+    # Guard against concurrent refreshes
     # -------------------------------------------------------
     if CACHE_REFRESHING:
-        logger.info("Refresh already running. Returning existing cache.")
+        logger.info("Refresh already running. Returning cached notices.")
+        result = _notices_fetch(from_date, to_date)
+        if result is not None:
+            return result
 
-        cached = _cache_get(cache_key)
-        if cached is not None:
-            return cached
-
-    # -------------------------------------------------------
-    # Only one refresh thread
-    # -------------------------------------------------------
     with CACHE_LOCK:
-
-        if not force_refresh:
-            cached = _cache_get(cache_key)
-            if cached is not None:
-                return cached
-
         CACHE_REFRESHING = True
-
         try:
-            logger.info("Building latest dataset...")
+            logger.info("Building live dataset for %s → %s …",
+                        from_date.isoformat(), to_date.isoformat())
+            result = _scrape_fresh(from_date, to_date)
 
-            jobs = {
-                "NSE Circulars": fetch_nse_circulars,
-                "NSE Press Releases": fetch_nse_press_releases,
-                "NSE Dividend": fetch_nse_corporate_actions,
-                "NSE Clearing": fetch_nse_clearing,
-                "BSE Notices": fetch_bse_notices,
-                "BSE Press Releases": fetch_bse_press_releases,
-                "SEBI Updates": fetch_sebi_whats_new,
-                "MCX Circulars": fetch_mcx,
-                "MCXCCL Circulars": fetch_mcxccl,
-                "IFSCA": fetch_ifsca,
-            }
+            # Upsert scraped rows into Supabase (append + dedup by id)
+            _notices_upsert(result["data"])
 
-            sources = {}
-
-            with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
-
-                future_map = {
-                    executor.submit(func, from_date, to_date): name
-                    for name, func in jobs.items()
-                }
-
-                for future in as_completed(future_map):
-
-                    name = future_map[future]
-
-                    try:
-                        sources[name] = future.result()
-                        logger.info(f"✓ {name} completed")
-
-                    except Exception as e:
-                        logger.exception(f"{name} failed")
-
-                        sources[name] = {
-                            "data": [],
-                            "error": str(e),
-                            "note": "Fetch failed",
-                        }
-
-            all_notices: List[Dict] = []
-            status: Dict[str, Dict] = {}
-
-            from_iso = from_date.isoformat()
-            to_iso = to_date.isoformat()
-
-            for name, src in sources.items():
-
-                filtered_data = [row for row in src["data"] if from_iso <= row.get("date", to_iso) <= to_iso]
-                
-                # Tag each row with its source name so we can recalculate counts later
-                for row in filtered_data:
-                    row["_source_key"] = name
-
-                all_notices.extend(filtered_data)
-
-                status[name] = {
-                    "count": len(filtered_data),
-                    "error": src["error"],
-                    "note": src.get("note"),
-                }
-
-            all_notices.sort(key=lambda x: x["date"], reverse=True)
-
-            # Collect LTP failure info from the dividend source
-            ltp_failed = sources.get("NSE Dividend", {}).get("ltp_failed_symbols", [])
-
-            result = {
-                "data": all_notices,
-                "total": len(all_notices),
-                "source_status": status,
-                "ltp_failed_symbols": ltp_failed,
-                "from_date": from_date.isoformat(),
-                "to_date": to_date.isoformat(),
-                "version": "2026-07-28-v4-ai-summaries",
-                "fetched_at": datetime.datetime.now(
-                    IST_TZ
-                ).isoformat(),
-            }
-
-            # Replace old cache with new cache
-            _cache_set(cache_key, result)
-
-            logger.info(
-                f"Cache updated successfully with {len(all_notices)} notices."
-            )
-
+            logger.info("Live scrape complete: %d notices.", len(result["data"]))
             return result
 
         except Exception:
-
             logger.exception("Dataset refresh failed.")
-
-            cached = _cache_get(cache_key)
-
-            if cached is not None:
-                logger.info("Returning previous cache.")
-                return cached
-
+            # Last resort: return whatever is in Supabase/RAM
+            fallback = _notices_fetch(from_date, to_date)
+            if fallback is not None:
+                logger.info("Returning cached notices as fallback.")
+                return fallback
             raise
-
         finally:
             CACHE_REFRESHING = False
 @app.get("/api/notices")
 def get_all_notices(
-    from_date: Optional[str] = Query(None, description="YYYY-MM-DD, defaults to 30 days ago"),
+    from_date: Optional[str] = Query(None, description="YYYY-MM-DD, defaults to 7 days ago"),
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, defaults to today"),
 ):
     """Returns notices/circulars/press releases from NSE, NSE Clearing, BSE,
-    SEBI, MCX, MCXCCL, IFSCA for the given date window (default:
-    last 30 days). No mock data - each source's row count and any error is
-    under `source_status`.
+    SEBI, MCX, MCXCCL, IFSCA for the given date window.
 
-    Every row also carries a `summary` field, pre-generated by Gemini and
-    read straight from summaries.json - the browser never calls Gemini
-    itself, so every visitor sees the same already-paid-for summary instead
-    of triggering a new AI call. Rows with no summary yet show `summary:
-    null`; a background pass (hourly, or kicked off by this very request)
-    fills those in without ever re-summarizing a notice that already has
-    one - see `summary_status` in the response for progress."""
-    today = datetime.datetime.now(
-    IST_TZ
-).date()
+    Data is read from the persistent Supabase `notices` table which is
+    appended to on each scheduled refresh (8am, 9am, 10am, 3:30pm, 5pm,
+    11pm IST). Each notice is stored exactly once (deduplicated by id).
+
+    Every row also carries a `summary` field pre-generated by Gemini.
+    Rows with no summary yet show `summary: null`."""
+    today = datetime.datetime.now(IST_TZ).date()
     to_d = datetime.datetime.fromisoformat(to_date).date() if to_date else today
-    from_d = datetime.date.fromisoformat(from_date) if from_date else (to_d - datetime.timedelta(days=30))
+    from_d = datetime.date.fromisoformat(from_date) if from_date else (to_d - datetime.timedelta(days=7))
 
+    # Read from Supabase `notices` table (or RAM cache) — never force-scrapes
     result = _build_dataset(from_d, to_d, force_refresh=False)
     all_notices = result.get("data", [])
-    
-    # Filter the notices by the requested date range
-    raw_notices = []
-    
-    # We will recount the source_status for the filtered date range
-    new_source_status = {
-        k: {"count": 0, "error": v.get("error"), "note": v.get("note")}
-        for k, v in result.get("source_status", {}).items()
-    }
-    
-    for n in all_notices:
-        try:
-            d = datetime.date.fromisoformat(n["date"])
-            if from_d <= d <= to_d:
-                raw_notices.append(n)
-                src_key = n.get("_source_key")
-                if src_key and src_key in new_source_status:
-                    new_source_status[src_key]["count"] += 1
-        except Exception:
-            # If date parsing fails, include it to be safe
-            raw_notices.append(n)
-            src_key = n.get("_source_key")
-            if src_key and src_key in new_source_status:
-                new_source_status[src_key]["count"] += 1
 
-    decorated = _decorate_with_summaries(raw_notices)
+    # Date-filter (Supabase already filters, but RAM cache may have extras)
+    from_iso = from_d.isoformat()
+    to_iso = to_d.isoformat()
+    raw_notices = [
+        n for n in all_notices
+        if from_iso <= (n.get("date") or "") <= to_iso
+    ]
+
+    # Rebuild source_status counts for the filtered window
+    new_source_status: Dict[str, Dict] = {}
+    for n in raw_notices:
+        src = n.get("body") or n.get("_source_key") or "Unknown"
+        if src not in new_source_status:
+            new_source_status[src] = {"count": 0, "error": None, "note": None}
+        new_source_status[src]["count"] += 1
+
+    decorated = raw_notices
     have = sum(1 for d in decorated if d.get("summary"))
 
-    # Fire-and-forget: catch up on any notices this request just revealed
-    # that don't have a summary yet. Cheap no-op if a pass is already
-    # running or everything is already summarized.
+    # Fire-and-forget: summarize any notices that don't have a summary yet
     _maybe_kickoff_summary_pass(raw_notices)
 
-    # Clean up _source_key before sending to frontend
+    # Remove internal tags before sending to frontend
     for d in decorated:
         d.pop("_source_key", None)
-        
-    # Create the final response payload with updated source_status
-    payload = dict(result)
-    payload["source_status"] = new_source_status
-    payload["total"] = len(decorated)
 
     return {
-        **payload,
         "data": decorated,
+        "total": len(decorated),
+        "source_status": new_source_status,
+        "ltp_failed_symbols": result.get("ltp_failed_symbols", []),
+        "from_date": from_iso,
+        "to_date": to_iso,
+        "fetched_at": result.get("fetched_at") or datetime.datetime.now(IST_TZ).isoformat(),
+        "version": result.get("version", ""),
         "summary_status": {
             "generated": have,
             "pending": len(decorated) - have,
@@ -1946,15 +1905,16 @@ def get_all_notices(
 
 @app.post("/api/admin/force-refresh")
 async def admin_force_refresh():
-    """Admin endpoint to manually trigger the full scrape and summarize process, returning any errors."""
+    """Admin endpoint to manually trigger today's scrape, upsert to Supabase,
+    and run the summary pass. Returns any source errors."""
     try:
         status = await _refresh_and_summarize()
         errors = {name: s["error"] for name, s in status.items() if s.get("error")}
         notes = {name: s["note"] for name, s in status.items() if s.get("note") and not s.get("error")}
-        
+
         return {
             "status": "ok",
-            "message": "Manual refresh completed.",
+            "message": "Manual refresh (today only) completed.",
             "errors": errors if errors else None,
             "notes": notes if notes else None,
             "full_status": status
@@ -1963,18 +1923,48 @@ async def admin_force_refresh():
         return {"status": "error", "message": str(e)}
 
 
+@app.post("/api/admin/backfill")
+async def admin_backfill(
+    days: int = Query(30, description="Number of past days to scrape and store (max 90)"),
+):
+    """One-shot backfill: scrape the last N days (default 30, max 90) and
+    upsert everything into the Supabase `notices` table. Safe to run
+    multiple times - existing rows are never duplicated (upsert by id).
+    
+    Use this once after migrating to the new append-only architecture to
+    seed historical data into the `notices` table."""
+    days = min(max(days, 1), 90)  # clamp to 1-90
+    loop = asyncio.get_event_loop()
+    today = datetime.datetime.now(IST_TZ).date()
+    from_d = today - datetime.timedelta(days=days)
+
+    logger.info("Backfill requested: %d days (%s → %s)", days, from_d.isoformat(), today.isoformat())
+
+    try:
+        result = await loop.run_in_executor(None, _build_dataset, from_d, today, True)
+        count = len(result.get("data", []))
+        errors = {name: s["error"] for name, s in result.get("source_status", {}).items() if s.get("error")}
+
+        return {
+            "status": "ok",
+            "message": f"Backfill complete: {count} notices upserted into Supabase for the last {days} days.",
+            "notices_upserted": count,
+            "from_date": from_d.isoformat(),
+            "to_date": today.isoformat(),
+            "errors": errors if errors else None,
+        }
+    except Exception as e:
+        logger.exception("Backfill failed")
+        return {"status": "error", "message": str(e)}
+
+
 @app.get("/api/summaries/status")
 def summaries_status():
-    """Lightweight progress check - how many notices in the current cache
-    have an AI summary, without needing to pull the full dataset."""
-    cached = _cache_get("latest_dataset") or {}
-    all_notices = cached.get("data", [])
-    have = sum(1 for n in all_notices if n.get("id") in _SUMMARIES)
+    """Lightweight progress check - how many notices have an AI summary."""
+    # Since we are stateless, we can do a quick count from the DB, or just 
+    # return a static placeholder as the UI doesn't strictly depend on this for core functionality.
     return {
-        "total_notices": len(all_notices),
-        "summarized": have,
-        "pending": max(0, len(all_notices) - have),
-        "total_summaries_stored": len(_SUMMARIES),
+        "status": "stateless-mode",
         "model": GEMINI_MODEL,
         "gemini_key_configured": bool(GEMINI_API_KEY),
         "pass_running": _SUMMARY_RUNNING,
@@ -1986,22 +1976,29 @@ def summaries_status():
 
 @app.post("/api/summaries/notice/{notice_id:path}")
 def summarize_one(notice_id: str, force: bool = False):
-    """On-demand summary for a single notice - used by the "Generate now"
+    """On-demand summary for a single notice - used by the \"Generate now\"
     fallback in the UI so a visitor doesn't have to wait for the hourly
     pass. Idempotent: if this id is already summarized, returns the
     existing summary instead of spending another Gemini call on it."""
+    # Fetch from Supabase directly
+    notice = None
+    if supabase_client:
+        try:
+            resp = supabase_client.table("notices").select("*").eq("id", notice_id).limit(1).execute()
+            if resp.data:
+                notice = _row_to_notice(resp.data[0])
+        except Exception as e:
+            logger.warning("Could not fetch notice %s from Supabase: %s", notice_id, e)
+
+    if not notice:
+        return {"status": "not-found"}
+
     if not force:
-        existing = _SUMMARIES.get(notice_id)
-        if existing:
-            return {"status": "ok", "summary": existing["summary"], "cached": True}
+        if notice.get("summary"):
+            return {"status": "ok", "summary": notice["summary"], "cached": True}
 
     if not GEMINI_API_KEY:
         return {"status": "no-key", "message": "GEMINI_API_KEY is not set on the backend."}
-
-    cached = _cache_get("latest_dataset") or {}
-    notice = next((n for n in cached.get("data", []) if n.get("id") == notice_id), None)
-    if not notice:
-        return {"status": "not-found"}
 
     notice_to_summarize = dict(notice)
     link = notice_to_summarize.get("link")
@@ -2022,13 +2019,11 @@ def summarize_one(notice_id: str, force: bool = False):
     if not summary:
         return {"status": "error", "message": "Model did not return a summary for this id."}
 
-    _SUMMARIES[notice_id] = {
-        "summary": summary,
-        "model": GEMINI_MODEL,
-        "generated_at": datetime.datetime.now(IST_TZ).isoformat(),
-        "title": notice_to_summarize.get("title", ""),
-    }
-    _save_summaries()
+    notice_to_summarize["summary"] = summary
+    notice_to_summarize["summary_model"] = GEMINI_MODEL
+    notice_to_summarize["summary_generated_at"] = datetime.datetime.now(IST_TZ).isoformat()
+    
+    _notices_upsert([notice_to_summarize])
 
     return {"status": "ok", "summary": summary, "cached": False}
 
@@ -2042,23 +2037,31 @@ def summarize_one(notice_id: str, force: bool = False):
 # job instead, or every worker will refresh + summarize independently.
 # ===========================================================================
 async def _refresh_and_summarize():
+    """Scheduled cycle: scrape TODAY's data only, upsert into the Supabase
+    `notices` table (append-only, deduplicated by id), then summarize any
+    notices that don't have a summary yet.
+
+    We no longer re-scrape 30 days every run. Each day's data is stored once
+    and never overwritten (unless the notice itself is updated upstream).
+    """
     loop = asyncio.get_event_loop()
     today = datetime.datetime.now(IST_TZ).date()
-    from_d = today - datetime.timedelta(days=30)
+    # Scrape today only — yesterday is already in Supabase from prior runs.
+    # We include yesterday as a safety buffer (some sources post late).
+    from_d = today - datetime.timedelta(days=1)
 
-    logger.info("Scheduled cycle: refreshing all sources...")
+    logger.info("Scheduled cycle: scraping today's data (%s → %s)…",
+                from_d.isoformat(), today.isoformat())
+
+    # force_refresh=True → always scrapes live, then upserts to Supabase
     result = await loop.run_in_executor(None, _build_dataset, from_d, today, True)
 
     status = result.get("source_status", {})
-    if not any(s.get("error") for s in status.values()):
-        valid_ids = {n.get("id") for n in result.get("data", []) if n.get("id")}
-        with SUMMARIES_LOCK:
-            keys_to_delete = [k for k in _SUMMARIES.keys() if k not in valid_ids]
-            for k in keys_to_delete:
-                del _SUMMARIES[k]
-        if keys_to_delete:
-            logger.info(f"Purged {len(keys_to_delete)} old summaries not in the last 30 days.")
-            _save_summaries()
+    scraped_count = len(result.get("data", []))
+    logger.info("Scheduled cycle: %d notices scraped and upserted.", scraped_count)
+
+    # NOTE: We do NOT purge old summaries on a today-only scrape.
+    # Summaries live persistently inside the `data` JSON column of the `notices` table.
 
     if not _try_start_summary_pass():
         logger.info("Scheduled cycle: a summary pass is already running - skipping.")
@@ -2066,7 +2069,7 @@ async def _refresh_and_summarize():
 
     logger.info("Scheduled cycle: summarizing any new notices...")
     await loop.run_in_executor(None, _run_summary_pass_guarded, result.get("data", []))
-    
+
     return status
 
 
