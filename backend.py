@@ -223,7 +223,12 @@ def _row_to_notice(row: Dict) -> Dict:
     return notice
 
 def _notices_upsert(notices: List[Dict]) -> int:
-    """Upsert notices into the hybrid Supabase table."""
+    """Upsert notices into the hybrid Supabase table.
+
+    Preserve any existing stored fields (especially AI summaries) when a fresh
+    scrape reuses the same notice id but doesn't include previously-generated
+    metadata in its payload. This avoids wiping summaries on every refresh.
+    """
     if not supabase_client or not notices:
         return len(notices)
 
@@ -232,9 +237,26 @@ def _notices_upsert(notices: List[Dict]) -> int:
 
     upserted = 0
     for i in range(0, len(rows), 100):
+        chunk = rows[i:i+100]
         try:
-            supabase_client.table("notices").upsert(rows[i:i+100]).execute()
-            upserted += len(rows[i:i+100])
+            ids = [r["id"] for r in chunk if r.get("id")]
+            existing = {}
+            if ids:
+                resp = supabase_client.table("notices").select("id,data").in_("id", ids).execute()
+                for row in (resp.data or []):
+                    existing[row.get("id")] = row.get("data") or {}
+
+            merged_chunk = []
+            for row in chunk:
+                rid = row.get("id")
+                if rid in existing:
+                    merged_data = dict(existing[rid])
+                    merged_data.update(row.get("data") or {})
+                    row["data"] = merged_data
+                merged_chunk.append(row)
+
+            supabase_client.table("notices").upsert(merged_chunk).execute()
+            upserted += len(merged_chunk)
         except Exception as e:
             logger.error(f"Failed to upsert notices: {e}")
 
