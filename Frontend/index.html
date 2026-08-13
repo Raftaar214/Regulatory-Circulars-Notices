@@ -449,10 +449,19 @@
             const toggleQuickFilter = (type) => {
                 setActiveQuickFilter(prev => {
                     const newFilter = prev === type ? null : type;
+
                     if (newFilter === 'dividend') {
                         setFilterBody('All');
                         setFilterCategory('All');
+                        setFilterFromDate(todayISO);
+                        setFilterToDate(todayISO);
+                        setAppliedDateRange({ fromDate: todayISO, toDate: todayISO });
+                    } else if (prev === 'dividend' && newFilter !== 'dividend') {
+                        setFilterFromDate(sevenDaysAgoISO);
+                        setFilterToDate(todayISO);
+                        setAppliedDateRange({ fromDate: sevenDaysAgoISO, toDate: todayISO });
                     }
+
                     return newFilter;
                 });
             };
