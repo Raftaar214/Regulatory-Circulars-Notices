@@ -1811,7 +1811,7 @@ def _build_dataset(from_date: datetime.date, to_date: datetime.date,
     The Supabase `notices` table is the persistent source of truth and grows
     day-by-day.
     """
-    global CACHE_REFRESHING
+    global CACHE_REFRESHING, LAST_REFRESHED_AT
 
     # -------------------------------------------------------
     # Normal page load: serve from Supabase / RAM cache
