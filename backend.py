@@ -1345,7 +1345,7 @@ def _fetch_ltp_for_symbols(symbols: List[str]) -> Dict[str, Optional[float]]:
                 # Response shape:
                 # {"equityResponse": [{
                 #   "orderBook": {"buyPrice1": 13977, "lastPrice": 13978, ...},
-                #   "metaData": {"averagePrice": 13928.12, ...},
+                #   "metaData": {"previousClose": 13928.12, "averagePrice": ...},
                 #   "tradeInfo": {"lastPrice": 13978, ...},
                 #   ...
                 # }]}
@@ -1356,14 +1356,17 @@ def _fetch_ltp_for_symbols(symbols: List[str]) -> Dict[str, Optional[float]]:
                     meta_data = item.get("metaData") or {}
                     trade_info = item.get("tradeInfo") or {}
 
-                    # Prefer orderBook.lastPrice (most accurate real-time),
-                    # then orderBook.buyPrice1, then tradeInfo.lastPrice,
-                    # then metaData.averagePrice
+                    # Prefer the freshest available quote, then fall back to the
+                    # most stable reference price if the live quote is blank.
+                    # This covers cases where NSE returns buyPrice1 or previousClose
+                    # but not a true lastPrice field for some REIT/InvIT symbols.
                     ltp_val = (
                         order_book.get("lastPrice")
                         or order_book.get("buyPrice1")
                         or trade_info.get("lastPrice")
+                        or meta_data.get("previousClose")
                         or meta_data.get("averagePrice")
+                        or meta_data.get("closePrice")
                     )
 
                 if ltp_val is not None:
