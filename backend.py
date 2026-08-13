@@ -130,6 +130,36 @@ CACHE_LOCK = threading.Lock()
 CACHE_REFRESHING = False
 LAST_REFRESHED_AT: Optional[str] = None
 
+
+def _normalize_datetime(value: Optional[str]) -> Optional[datetime.datetime]:
+    """Parse ISO-like values and normalize them to IST."""
+    if value is None or value == "":
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        try:
+            dt = datetime.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=IST_TZ)
+    return dt.astimezone(IST_TZ)
+
+
+def _latest_refresh_timestamp(last_refresh_at: Optional[str], max_scraped: Optional[str]) -> str:
+    """Use the newest valid refresh/scrape timestamp. Avoid stale in-memory values."""
+    candidates: List[datetime.datetime] = []
+    for value in (last_refresh_at, max_scraped):
+        dt = _normalize_datetime(value)
+        if dt is not None:
+            candidates.append(dt)
+
+    if candidates:
+        return max(candidates).isoformat()
+    return datetime.datetime.now(IST_TZ).isoformat()
+
 # ---------------------------------------------------------------------------
 # Supabase `notices` table helpers  (JSONB hybrid design)
 #
@@ -253,14 +283,10 @@ def _wrap_notices_result(notices: List[Dict], from_date: datetime.date,
             if not max_scraped or sa > max_scraped:
                 max_scraped = sa
                 
-    # Fallback order: Global last refresh time -> Max scraped_at -> Now
+    # Prefer the newest valid refresh/scrape timestamp to avoid stale in-memory
+    # values from a previous scheduler cycle appearing on the frontend.
     global LAST_REFRESHED_AT
-    if LAST_REFRESHED_AT:
-        fetched_at = LAST_REFRESHED_AT
-    elif max_scraped:
-        fetched_at = max_scraped
-    else:
-        fetched_at = datetime.datetime.now(IST_TZ).isoformat()
+    fetched_at = _latest_refresh_timestamp(LAST_REFRESHED_AT, max_scraped)
 
     return {
         "data": notices,
