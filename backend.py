@@ -130,36 +130,6 @@ CACHE_LOCK = threading.Lock()
 CACHE_REFRESHING = False
 LAST_REFRESHED_AT: Optional[str] = None
 
-
-def _normalize_datetime(value: Optional[str]) -> Optional[datetime.datetime]:
-    """Parse ISO-like timestamps and normalize them to IST."""
-    if value is None or value == "":
-        return None
-    try:
-        dt = datetime.datetime.fromisoformat(value)
-    except ValueError:
-        try:
-            dt = datetime.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            return None
-
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=IST_TZ)
-    return dt.astimezone(IST_TZ)
-
-
-def _latest_refresh_timestamp(last_refresh_at: Optional[str], max_scraped: Optional[str]) -> str:
-    """Use the newest credible refresh timestamp; avoid stale in-memory values."""
-    candidates = []
-    for value in (last_refresh_at, max_scraped):
-        dt = _normalize_datetime(value)
-        if dt is not None:
-            candidates.append(dt)
-
-    if candidates:
-        return max(candidates).isoformat()
-    return datetime.datetime.now(IST_TZ).isoformat()
-
 # ---------------------------------------------------------------------------
 # Supabase `notices` table helpers  (JSONB hybrid design)
 #
@@ -283,10 +253,14 @@ def _wrap_notices_result(notices: List[Dict], from_date: datetime.date,
             if not max_scraped or sa > max_scraped:
                 max_scraped = sa
                 
-    # Prefer the newest valid refresh/scrape timestamp to avoid stale in-memory
-    # values from an earlier scheduler cycle being shown on the frontend.
+    # Fallback order: Global last refresh time -> Max scraped_at -> Now
     global LAST_REFRESHED_AT
-    fetched_at = _latest_refresh_timestamp(LAST_REFRESHED_AT, max_scraped)
+    if LAST_REFRESHED_AT:
+        fetched_at = LAST_REFRESHED_AT
+    elif max_scraped:
+        fetched_at = max_scraped
+    else:
+        fetched_at = datetime.datetime.now(IST_TZ).isoformat()
 
     return {
         "data": notices,
@@ -1482,7 +1456,9 @@ def fetch_nse_corporate_actions(from_date: datetime.date,
         response = session.get(
             "https://www.nseindia.com/api/corporates-corporateActions",
             params={
-                "index": "equities"
+                "index": "equities",
+                "from_date": from_date.strftime("%d-%m-%Y"),
+                "to_date": to_date.strftime("%d-%m-%Y")
             },
             headers={
                 "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-actions"
