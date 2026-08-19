@@ -19,6 +19,9 @@
     <!-- Lucide Icons (Vanilla) -->
     <script src="https://unpkg.com/lucide@latest"></script>
 
+    <!-- html2pdf -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+
     <!-- Google Fonts -->
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 
@@ -111,22 +114,22 @@
 
         // TIER 1 - same-day relevant: changes margin, tradeable names, or price limits right now
         const TIER1_CATEGORIES = {
-            'Margin & Collateral': ['span', 'extreme loss margin', 'elm', 'initial margin', 'exposure margin', 'additional margin', 'special margin', 'peak margin', 'var margin', 'tender margin', 'delivery margin', 'ad-hoc margin', 'margin requirement', 'margin framework', 'collateral haircut', 'cross margin', 'collateral'],
-            'Surveillance Action (ASM/GSM/ESM)': ['additional surveillance measure', 'asm', 'graded surveillance measure', 'gsm', 'enhanced surveillance measure', 'esm', 'risk reduction mode', 'rrm', 'lt-asm', 'st-asm'],
+            'New Contracts & Index Changes': ['new derivative contract', 'inclusion in nifty', 'exclusion from nifty', 'inclusion in sensex', 'exclusion from sensex', 'reconstitution of', 'index methodology'],
+            'Margin & Collateral': ['span', 'extreme loss margin', 'elm', 'initial margin', 'exposure margin', 'additional margin', 'special margin', 'peak margin', 'var margin', 'tender margin', 'delivery margin', 'ad-hoc margin', 'margin requirement', 'margin framework', 'collateral haircut', 'cross margin', 'collateral', 'margin shortfall', 'haircut revision', 'cash margin'],
             'Position Limits & Ban Period': ['market wide position limit', 'mwpl', 'position limit', 'position limits', 'ban period', 'client position limit'],
-            'Trading Halt / Price Band': ['suspension of trading', 'trading halt', 'circuit filter', 'price band', 'trading restriction', 'trading restrictions'],
-            'F&O Contract Changes': ['adjustment of futures and options', 'contract specification', 'contract specifications', 'lot size', 'quantity freeze', 'strike interval', 'tick size', 'expiry day', 'introduction of futures'],
+            'Algo & Market Access': ['algorithmic trading', 'algo', 'direct market access', 'dma', 'co-location', 'order to trade ratio', 'api facility', 'trade annulment', 'trade cancellation', 'colocation rack', 'tick-by-tick', 'tbt data', 'api rate limit', 'latency'],
+            'F&O Contract Changes': ['adjustment of futures and options', 'contract specification', 'contract specifications', 'lot size', 'quantity freeze', 'strike interval', 'scheme of strikes', 'tick size', 'expiry day', 'introduction of futures', 'change in expiry', 'revision in market lot', 'revised lot size', 'new strike', 'option chain'],
+            'F&O Settlement & Delivery': ['physical settlement', 'auction session', 'delivery settlement', 'short delivery'],
+            'Market Uptime': ['technical glitch', 'extension of trading hours'],
             'Commodity Settlement (MCX)': ['due date rate', 'due date rates', 'event based additional surveillance', 'e-asm'],
         };
 
         // TIER 2 - relevant this week: shapes what/how you'll trade soon, not urgent today
         const TIER2_CATEGORIES = {
-            'New Contracts & Index Changes': ['new derivative contract', 'inclusion in nifty', 'exclusion from nifty', 'inclusion in sensex', 'exclusion from sensex', 'reconstitution of', 'index methodology'],
-            'Corporate Actions (pre-adjustment)': ['bonus issue', 'rights issue', 'stock split', 'face value split'],
             'Clearing & Settlement Calendar': ['settlement calendar', 'settlement schedule'],
-            'Algo & Market Access': ['algorithmic trading', 'algo', 'direct market access', 'dma', 'co-location', 'order to trade ratio', 'api facility'],
             'FPI & Institutional Flows': ['foreign portfolio investor', 'fpi', 'fii'],
             'Regulatory Framework': ['sebi regulations', 'consultation paper', 'master circular'],
+            'Mock / Test Sessions': ['mock trading', 'mock session'],
         };
 
         // TIER 3 - background awareness, low urgency
@@ -134,7 +137,7 @@
             'Listings & Filings': ['listing of', 'esop', 'esos'],
             'Reports & Bulletins': ['bulletin', 'publication', 'speech', 'report'],
             'Company Clarifications': ['clarification received', 'news about'],
-            'Mock / Test Sessions': ['mock trading', 'mock session'],
+            'Corporate Actions (pre-adjustment)': ['bonus issue', 'rights issue', 'stock split', 'face value split'],
         };
 
         // Not relevant to trading decisions - shown, but no P1/P2/P3 badge
@@ -144,6 +147,9 @@
             'Membership / Compliance Admin': ['vapt report', 'software as a service', 'renewal process for registration', 'segmental surrender', 'empanel'],
             'Corporate Calendar': ['change in name of company', 'agm', 'board meeting', 'change in status of company'],
             'Investor Caution': ['caution to investors', 'caution for investors'],
+            'Surveillance Action (ASM/GSM/ESM)': ['additional surveillance measure', 'asm', 'graded surveillance measure', 'gsm', 'enhanced surveillance measure', 'esm', 'risk reduction mode', 'rrm', 'lt-asm', 'st-asm'],
+            'Trading Halt / Price Band': ['suspension of trading', 'trading halt', 'circuit filter', 'price band', 'trading restriction', 'trading restrictions'],
+            'Mutual Funds': ['mutual fund', 'mf margin', 'mutual fund collateral', 'mf collateral', 'approved units'],
         };
 
         const IMPACT_WORDS = [
@@ -152,7 +158,7 @@
             'restricted', 'banned', 'freeze', 'halted'
         ];
 
-        const escapeRegExp = (string) => string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const escapeRegExp = (string) => String(string).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
         // Highest-scoring category name within one tier's group, plus its
         // score (0 = nothing in this group matched). Summary matches count
@@ -190,9 +196,12 @@
 
             const anyRelevantMatch = t1.score > 0 || t2.score > 0 || t3.score > 0;
 
+            const isMutualFundIgnore = ignoreHit.category === 'Mutual Funds';
+
             // Recognized as not trading-relevant, and nothing relevant also
             // matched - leave it unmarked instead of forcing a P3 badge.
-            if (ignoreHit.score > 0 && !anyRelevantMatch) {
+            // Explicitly force ignore for Mutual Funds even if they mention collateral.
+            if (ignoreHit.score > 0 && (!anyRelevantMatch || isMutualFundIgnore)) {
                 return { ...item, priority: null, category: ignoreHit.category || item.category || 'Administrative' };
             }
 
@@ -224,7 +233,7 @@
         // Helper to extract dividend amount
         const extractDividendAmount = (subject) => {
             if (!subject) return "";
-            const match = subject.match(/(?:Rs|Re)\.?\s*([\d.]+)/i);
+            const match = subject.match(/(?:Rs|Re).?s*([d.]+)/i);
             if (match && match[1]) {
                 return `₹${match[1]}`;
             }
@@ -323,6 +332,8 @@
 
             // Per-Row Summary State
             const [rowSummaries, setRowSummaries] = useState({});
+
+            const [selectedItems, setSelectedItems] = useState(new Set());
 
             const [appliedDateRange, setAppliedDateRange] = useState({
                 fromDate: sevenDaysAgoISO, toDate: todayISO
@@ -433,6 +444,35 @@
             const totalPages = Math.max(1, Math.ceil(displayedData.length / PAGE_SIZE));
             const pagedData = displayedData.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
 
+            const handleToggleSelect = (rowKey) => {
+                setSelectedItems(prev => {
+                    const next = new Set(prev);
+                    if (next.has(rowKey)) {
+                        next.delete(rowKey);
+                    } else {
+                        next.add(rowKey);
+                    }
+                    return next;
+                });
+            };
+
+            const handleSelectAllVisible = (e) => {
+                const keys = pagedData.map(getRowKey);
+                if (e.target.checked) {
+                    setSelectedItems(prev => {
+                        const next = new Set(prev);
+                        keys.forEach(k => next.add(k));
+                        return next;
+                    });
+                } else {
+                    setSelectedItems(prev => {
+                        const next = new Set(prev);
+                        keys.forEach(k => next.delete(k));
+                        return next;
+                    });
+                }
+            };
+
             const handleFilter = () => {
                 setAppliedDateRange({ fromDate: filterFromDate, toDate: filterToDate });
                 setPage(1);
@@ -512,6 +552,312 @@
                 return [...new Set(allData.filter(item => item.type !== 'dividend').map(item => item.category))].filter(Boolean).sort();
             }, [allData]);
 
+            const downloadBriefing = (customItems = null) => {
+                const today = new Date();
+                const yesterday = new Date(today);
+                yesterday.setDate(yesterday.getDate() - 1);
+
+                // Use en-CA to safely get YYYY-MM-DD in local time
+                const todayStrLocal = today.toLocaleDateString('en-CA');
+                const yesterdayStrLocal = yesterday.toLocaleDateString('en-CA');
+
+                const briefingItems = customItems || allData.filter(item => {
+                    if (item.type === 'dividend') return false;
+                    if (!item.priority) return false;
+                    if (!item.date) return false;
+                    const itemDateLocal = new Date(item.date).toLocaleDateString('en-CA');
+                    return itemDateLocal === todayStrLocal || itemDateLocal === yesterdayStrLocal;
+                });
+
+                const p1 = briefingItems.filter(i => i.priority === 'P1');
+                const p2 = briefingItems.filter(i => i.priority === 'P2');
+                const p3 = briefingItems.filter(i => i.priority === 'P3');
+
+                const CSS = `
+:root{
+  --paper:#f8f9fa;
+  --ink:#111827;
+  --rule:#e5e7eb;
+  --muted:#4b5563;
+  --p1:#ea580c;
+  --p2:#0f766e;
+  --chip:#e2e8f0;
+}
+
+*{
+  box-sizing:border-box;
+}
+
+html, body{
+  margin: 0;
+  padding: 0;
+  background-color: var(--paper);
+  color: var(--ink);
+  min-height: 100vh;
+}
+
+body{
+  font: 13px/1.4 Arial, sans-serif;
+}
+
+.sheet{
+  box-sizing: border-box;
+  width: calc(100% - 36mm);
+  max-width: none;
+  margin: 15mm auto 18mm;
+}
+
+header{
+  border-bottom:2px double var(--ink);
+  padding-bottom:10px;
+  margin-bottom:8px;
+}
+
+h1{
+  font:700 20px/1.2 Arial,sans-serif;
+  margin:0;
+  color:#000000;
+  letter-spacing:.4px;
+}
+
+.meta{
+  font:600 11px/1.4 'Courier New',monospace;
+  color:var(--muted);
+  text-transform:uppercase;
+  letter-spacing:1px;
+  margin-top:4px;
+}
+
+.counts{
+  display:flex;
+  gap:16px;
+  border-bottom:1px solid var(--rule);
+  padding:12px 0;
+  font:600 12px 'Courier New',monospace;
+}
+
+.counts b{
+  font-size:18px;
+  display:block;
+  color:var(--ink);
+}
+
+section h2{
+  font:700 12px 'Courier New',monospace;
+  text-transform:uppercase;
+  letter-spacing:1px;
+  color:var(--muted);
+  margin:24px 0 8px;
+  border-bottom:2px solid var(--rule);
+  padding-bottom:4px;
+}
+
+/* One complete notice/article */
+article{
+  padding:10px 0 12px;
+  border-bottom:1px solid var(--rule);
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+
+  /* Prevent html2pdf from splitting one notice badly */
+  page-break-inside:avoid;
+  break-inside:avoid;
+}
+
+.badges{
+  display:flex;
+  gap:6px;
+  margin-bottom:0;
+}
+
+.tag{
+  font:700 10px 'Courier New',monospace;
+  padding:2px 6px;
+  border-radius:4px;
+  background:var(--chip);
+  color:var(--ink);
+  text-transform:uppercase;
+  letter-spacing:1px;
+  display:inline-block;
+}
+
+.tag.p1{
+  background:var(--p1);
+  color:#ffffff;
+}
+
+.tag.p2{
+  background:var(--p2);
+  color:#ffffff;
+}
+
+.date{
+  font:600 11px 'Courier New',monospace;
+  color:var(--muted);
+  margin-bottom:0;
+}
+
+article h3{
+  margin:0;
+  font-size:15px;
+  line-height:1.3;
+  font-weight:700;
+  color:#000000;
+}
+
+article h3 a{
+  color:inherit;
+  text-decoration:none;
+}
+
+.desc{
+  margin:0;
+  font-size:13px;
+  color:var(--ink);
+  line-height:1.45;
+  max-width:85ch;
+}
+
+/* Read circular is always on its own line */
+.link-wrapper{
+  display:block;
+  width:100%;
+  margin-top:2px;
+  margin-bottom:2px;
+}
+
+.more{
+  font:600 12px Arial,sans-serif;
+  color:var(--p1);
+  text-decoration:none;
+  display:inline-block;
+}
+
+.category{
+  font:600 11px 'Courier New',monospace;
+  color:var(--muted);
+  margin-top:4px;
+  border-top:1px dashed var(--rule);
+  padding-top:4px;
+}
+
+footer{
+  margin-top:24px;
+  font:600 11px 'Courier New',monospace;
+  color:var(--muted);
+}
+
+.empty{
+  color:var(--muted);
+  font-style:italic;
+  padding:12px 0;
+  font-weight:500;
+}
+                `;
+
+                const escapeHTML = (str) => {
+                    if (!str) return '';
+                    return String(str)
+                        .replace(/&/g, "&amp;")
+                        .replace(/</g, "&lt;")
+                        .replace(/>/g, "&gt;")
+                        .replace(/"/g, "&quot;")
+                        .replace(/'/g, "&#039;");
+                };
+
+                const formatDate = (dateStr) => {
+                    if (!dateStr) return '';
+                    const d = new Date(dateStr);
+                    return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+                };
+
+                const renderArticle = (it) => {
+                    const pr = (it.priority || '').toLowerCase();
+                    const summ = escapeHTML(cleanTitle(it.summary || ''));
+                    const date = formatDate(it.date);
+                    const source = escapeHTML(it.body || 'Unknown');
+                    const title = escapeHTML(cleanTitle(it.title || 'Untitled'));
+                    const url = escapeHTML(it.link || '#');
+                    const cat = escapeHTML(it.category || '');
+
+                    return `
+<article>
+  <div class="badges">
+    <span class="tag ${pr}">${it.priority || 'P3'}</span>
+    <span class="tag">${source}</span>
+  </div>
+
+  <div class="date">${date}</div>
+
+  <h3><a href="${url}" target="_blank">${title}</a></h3>
+
+  ${summ ? `<p class="desc">${summ}</p>` : ''}
+
+  <div class="link-wrapper">
+    <a class="more" href="${url}" target="_blank">Read circular →</a>
+  </div>
+
+  ${cat ? `<div class="category">category: ${cat}</div>` : ''}
+</article>`;
+                };
+
+                const renderBlock = (title, rows) => {
+                    const inner = rows.length > 0 ? rows.map(renderArticle).join('') : '<div class="empty">Nothing new.</div>';
+                    return `<section><h2>${title}</h2>${inner}</section>`;
+                };
+
+                const nowStr = new Date().toLocaleString('en-IN', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+
+                const doc = `<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RegWatch briefing</title><style>${CSS}</style></head><body>
+<div class="sheet">
+<header><h1>RegWatch — Indian Market Regulatory Briefing</h1>
+<div class="meta">Shree Research · ${nowStr}</div></header>
+<div class="counts">
+  <div><b>${p1.length}</b>P1 direct impact</div>
+  <div><b>${p2.length}</b>P2 relevant</div>
+  <div><b>${p3.length}</b>P3 peripheral</div>
+</div>
+${renderBlock("P1 · Direct impact", p1)}
+${renderBlock("P2 · Relevant", p2)}
+${renderBlock("P3 · Peripheral", p3)}
+<footer>All configured sources responded.</footer>
+</div></body></html>`;
+
+                const opt = {
+                    margin: 0,
+                    filename: `Briefing_${todayStrLocal}.pdf`,
+                    image: {
+                        type: 'jpeg',
+                        quality: 1.0
+                    },
+                    html2canvas: {
+                        scale: 2,
+                        useCORS: true,
+                        backgroundColor: '#f8f9fa'
+                    },
+                    jsPDF: {
+                        unit: 'mm',
+                        format: 'a4',
+                        orientation: 'portrait'
+                    }
+                };
+
+                html2pdf().set(opt).from(doc).save();
+            };
+
+            const generateSelectedBriefing = () => {
+                if (selectedItems.size === 0) {
+                    alert("Please select at least one circular to generate a briefing.");
+                    return;
+                }
+                const customItems = allData.filter(item => selectedItems.has(getRowKey(item)));
+                downloadBriefing(customItems);
+                setSelectedItems(new Set());
+            };
+
             return (
                 <div className="h-screen p-2 md:p-4 flex flex-col overflow-hidden bg-slate-50 relative">
                     <div className="max-w-[1600px] mx-auto w-full flex flex-col h-full gap-2">
@@ -557,7 +903,7 @@
                                             className={`text-[11px] font-bold px-2.5 rounded-full transition-colors h-[24px] flex items-center ${activeQuickFilter === 'P1'
                                                 ? 'bg-red-600 text-white shadow-sm border border-red-600'
                                                 : 'bg-red-50 text-red-700 hover:bg-red-100 border border-red-200'
-                                                }`}
+                                                } `}
                                         >
                                             P1 (Critical)
                                         </button>
@@ -567,7 +913,7 @@
                                             className={`text-[11px] font-bold px-2.5 rounded-full transition-colors h-[24px] flex items-center ${activeQuickFilter === 'P2'
                                                 ? 'bg-amber-500 text-white shadow-sm border border-amber-500'
                                                 : 'bg-amber-50 text-amber-700 hover:bg-amber-100 border border-amber-200'
-                                                }`}
+                                                } `}
                                         >
                                             P2 (High)
                                         </button>
@@ -577,7 +923,7 @@
                                             className={`text-[11px] font-bold px-2.5 rounded-full transition-colors h-[24px] flex items-center ${activeQuickFilter === 'P3'
                                                 ? 'bg-blue-600 text-white shadow-sm border border-blue-600'
                                                 : 'bg-blue-50 text-blue-700 hover:bg-blue-100 border border-blue-200'
-                                                }`}
+                                                } `}
                                         >
                                             P3 (Medium)
                                         </button>
@@ -589,9 +935,25 @@
                                             className={`text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] ${activeQuickFilter === 'dividend'
                                                 ? 'bg-emerald-600 text-white shadow-sm border border-emerald-600'
                                                 : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 border border-emerald-200'
-                                                }`}
+                                                } `}
                                         >
                                             <Icon name="banknote" className="w-3 h-3" /> Dividend
+                                        </button>
+
+                                        <div className="w-px h-3.5 bg-slate-300 mx-0.5 hidden sm:block"></div>
+
+                                        <button
+                                            onClick={() => downloadBriefing(null)}
+                                            className="text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-300 shadow-sm ml-auto"
+                                            title="Export today's and yesterday's P1/P2/P3 circulars"
+                                        >
+                                            <Icon name="download" className="w-3 h-3" /> Export Briefing
+                                        </button>
+                                        <button
+                                            onClick={generateSelectedBriefing}
+                                            className="text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 shadow-sm"
+                                        >
+                                            <Icon name="check-circle" className="w-3 h-3" /> Generate Briefing ({selectedItems.size})
                                         </button>
                                     </div>
                                 </div>
@@ -609,8 +971,9 @@
 
                             {!connectionError && !isLoading && (
                                 <p className="mt-1 text-[11px] text-slate-400">
-                                    {totalLive} live rows fetched{fetchedAt ? ` • last updated ${new Date(fetchedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })}` : ''}
-                                    {summaryStatus && summaryStatus.model ? ` • AI summaries: ${summaryStatus.generated}/${summaryStatus.generated + summaryStatus.pending}` : ''}
+                                    {totalLive} live rows fetched{fetchedAt ? ` • last updated ${new Date(fetchedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} ` : ''}
+                                    {summaryStatus && summaryStatus.model ? ` • AI summaries: ${summaryStatus.generated}/${summaryStatus.generated + summaryStatus.pending}` : ''
+                                    }
                                 </p>
                             )}
                         </div>
@@ -817,12 +1180,20 @@
                                                 <th className="px-3 py-1.5 font-semibold text-sm min-w-[300px]">Title</th>
                                                 <th className="px-3 py-1.5 font-semibold text-sm min-w-[250px]">Summary</th>
                                                 <th className="px-3 py-1.5 font-semibold text-sm text-center whitespace-nowrap">Document</th>
+                                                <th className="px-3 py-1.5 text-center w-[40px]">
+                                                    <input
+                                                        type="checkbox"
+                                                        className="w-4 h-4 text-indigo-600 rounded border-slate-300 cursor-pointer"
+                                                        onChange={handleSelectAllVisible}
+                                                        checked={pagedData.length > 0 && pagedData.every(row => selectedItems.has(getRowKey(row)))}
+                                                    />
+                                                </th>
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-200">
                                             {isLoading ? (
                                                 <tr>
-                                                    <td colSpan="6" className="px-6 py-16 text-center text-slate-500">
+                                                    <td colSpan="7" className="px-6 py-16 text-center text-slate-500">
                                                         <div className="flex flex-col items-center justify-center space-y-3">
                                                             <Icon name="loader-2" className="w-8 h-8 text-indigo-600 animate-spin" />
                                                             <p className="text-base font-medium">Fetching live circulars and notices…</p>
@@ -890,6 +1261,14 @@
                                                                     <Icon name="file-text" className="w-5 h-5" />
                                                                 </a>
                                                             </td>
+                                                            <td className="px-3 py-1.5 text-center">
+                                                                <input
+                                                                    type="checkbox"
+                                                                    className="w-4 h-4 text-indigo-600 rounded border-slate-300 cursor-pointer"
+                                                                    checked={selectedItems.has(rowKey)}
+                                                                    onChange={() => handleToggleSelect(rowKey)}
+                                                                />
+                                                            </td>
                                                         </tr>
                                                     );
                                                 })
@@ -909,53 +1288,55 @@
                                 </div>
                             )}
 
-                            {displayedData.length > 0 && (
-                                <div className="bg-slate-50 border-t border-slate-200 px-6 py-3 flex items-center justify-between text-sm text-slate-500">
-                                    <span>
-                                        Showing {(page - 1) * PAGE_SIZE + 1}-{Math.min(page * PAGE_SIZE, displayedData.length)} of {displayedData.length} entries
-                                    </span>
-                                    <div className="flex items-center gap-2">
-                                        <button
-                                            onClick={() => setPage(p => Math.max(1, p - 1))}
-                                            disabled={page <= 1}
-                                            className="p-1.5 rounded-md border border-slate-300 disabled:opacity-40 hover:bg-slate-100"
-                                        >
-                                            <Icon name="chevron-left" className="w-4 h-4" />
-                                        </button>
-                                        <span className="flex items-center gap-1.5">
-                                            Page
-                                            <input
-                                                type="text"
-                                                value={pageInput}
-                                                onChange={(e) => {
-                                                    const val = e.target.value;
-                                                    setPageInput(val);
-                                                    if (val !== '') {
-                                                        const num = parseInt(val, 10);
-                                                        if (!isNaN(num)) {
-                                                            setPage(Math.min(Math.max(1, num), totalPages));
-                                                        }
-                                                    }
-                                                }}
-                                                onBlur={() => {
-                                                    if (pageInput === '' || isNaN(parseInt(pageInput, 10))) {
-                                                        setPageInput(page.toString());
-                                                    }
-                                                }}
-                                                className="w-16 px-2 py-1 text-center border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none text-sm"
-                                            />
-                                            of {totalPages}
+                            {
+                                displayedData.length > 0 && (
+                                    <div className="bg-slate-50 border-t border-slate-200 px-6 py-3 flex items-center justify-between text-sm text-slate-500">
+                                        <span>
+                                            Showing {(page - 1) * PAGE_SIZE + 1}-{Math.min(page * PAGE_SIZE, displayedData.length)} of {displayedData.length} entries
                                         </span>
-                                        <button
-                                            onClick={() => setPage(p => Math.min(totalPages, p + 1))}
-                                            disabled={page >= totalPages}
-                                            className="p-1.5 rounded-md border border-slate-300 disabled:opacity-40 hover:bg-slate-100"
-                                        >
-                                            <Icon name="chevron-right" className="w-4 h-4" />
-                                        </button>
+                                        <div className="flex items-center gap-2">
+                                            <button
+                                                onClick={() => setPage(p => Math.max(1, p - 1))}
+                                                disabled={page <= 1}
+                                                className="p-1.5 rounded-md border border-slate-300 disabled:opacity-40 hover:bg-slate-100"
+                                            >
+                                                <Icon name="chevron-left" className="w-4 h-4" />
+                                            </button>
+                                            <span className="flex items-center gap-1.5">
+                                                Page
+                                                <input
+                                                    type="text"
+                                                    value={pageInput}
+                                                    onChange={(e) => {
+                                                        const val = e.target.value;
+                                                        setPageInput(val);
+                                                        if (val !== '') {
+                                                            const num = parseInt(val, 10);
+                                                            if (!isNaN(num)) {
+                                                                setPage(Math.min(Math.max(1, num), totalPages));
+                                                            }
+                                                        }
+                                                    }}
+                                                    onBlur={() => {
+                                                        if (pageInput === '' || isNaN(parseInt(pageInput, 10))) {
+                                                            setPageInput(page.toString());
+                                                        }
+                                                    }}
+                                                    className="w-16 px-2 py-1 text-center border border-slate-300 rounded-md focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none text-sm"
+                                                />
+                                                of {totalPages}
+                                            </span>
+                                            <button
+                                                onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                                                disabled={page >= totalPages}
+                                                className="p-1.5 rounded-md border border-slate-300 disabled:opacity-40 hover:bg-slate-100"
+                                            >
+                                                <Icon name="chevron-right" className="w-4 h-4" />
+                                            </button>
+                                        </div>
                                     </div>
-                                </div>
-                            )}
+                                )
+                            }
                         </div>
 
                     </div>
