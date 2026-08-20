@@ -54,6 +54,7 @@ GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMI
 # tripping 429s. Raise these once you're on a paid tier.
 SUMMARY_CHUNK_SIZE = int(os.environ.get("SUMMARY_CHUNK_SIZE", "12"))
 SUMMARY_CHUNK_DELAY_SECONDS = float(os.environ.get("SUMMARY_CHUNK_DELAY_SECONDS", "6"))
+SUMMARY_PROMPT_VERSION = "impact-v2"
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
@@ -395,13 +396,17 @@ def _gemini_summarize_chunk(items: List[Dict]) -> Dict[str, str]:
             payload_items.append(notice_payload)
 
     system_instruction = (
-        "You are a concise financial regulatory analyst. You will receive a JSON array of "
-        "Indian stock-market notices and dividend announcements, each with an 'id'. For every "
-        "item, write a single 1-2 sentence summary of its core impact or directive; for "
-        "dividends, mention the company, amount, and ex-date. Never use markdown formatting "
-        "such as bold or bullet points. Respond with ONLY a JSON array, no other text and no "
-        "markdown code fences, with exactly one object per input item in this exact shape: "
-        '[{"id": "<same id as input>", "summary": "<your 1-2 sentence summary>"}, ...]. '
+        "You are a financial regulatory analyst writing for an Indian stock-market trader. "
+        "You will receive a JSON array of notices and dividend announcements, each with an 'id'. "
+        "For every notice, explain in 2-3 plain-English sentences: (1) what the exchange or "
+        "regulator actually did or announced, (2) who or which securities or members are affected, "
+        "and (3) what changes in practice, including any effective date, requirement, restriction, "
+        "deadline, or action a reader should take. Do not merely repeat the title, and do not invent "
+        "facts that are absent from the notice or document. Use the supplied document text when it "
+        "contains specific details. For dividends, mention the company, amount, and ex-date. "
+        "Never use markdown formatting such as bold or bullet points. Respond with ONLY a JSON array, "
+        "no other text and no markdown code fences, with exactly one object per input item in this "
+        "exact shape: [{\"id\": \"<same id as input>\", \"summary\": \"<your clear 2-3 sentence summary>\"}, ...]. "
         "Reuse each input id unchanged so the caller can match summaries back to notices."
     )
 
@@ -474,7 +479,13 @@ def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
     if not GEMINI_API_KEY:
         return {"generated": 0, "pending": len(notices)}
 
-    pending = [n for n in notices if n.get("id") and not n.get("summary")]
+    pending = [
+        n for n in notices
+        if n.get("id") and (
+            not n.get("summary")
+            or n.get("summary_prompt_version") != SUMMARY_PROMPT_VERSION
+        )
+    ]
 
     if not pending:
         logger.info("Summary pass: nothing new (%d notices already covered).", len(notices))
@@ -520,6 +531,7 @@ def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
                     item["summary"] = result[rid]
                     item["summary_generated_at"] = now_iso
                     item["summary_model"] = GEMINI_MODEL
+                    item["summary_prompt_version"] = SUMMARY_PROMPT_VERSION
                     updated_notices.append(item)
             
             generated += len(result)
@@ -2067,7 +2079,10 @@ def summarize_one(notice_id: str, force: bool = False):
         return {"status": "not-found"}
 
     if not force:
-        if notice.get("summary"):
+        if (
+            notice.get("summary")
+            and notice.get("summary_prompt_version") == SUMMARY_PROMPT_VERSION
+        ):
             return {"status": "ok", "summary": notice["summary"], "cached": True}
 
     if not GEMINI_API_KEY:
@@ -2095,6 +2110,7 @@ def summarize_one(notice_id: str, force: bool = False):
     notice_to_summarize["summary"] = summary
     notice_to_summarize["summary_model"] = GEMINI_MODEL
     notice_to_summarize["summary_generated_at"] = datetime.datetime.now(IST_TZ).isoformat()
+    notice_to_summarize["summary_prompt_version"] = SUMMARY_PROMPT_VERSION
     
     _notices_upsert([notice_to_summarize])
 
