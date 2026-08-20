@@ -491,6 +491,9 @@
                     const newFilter = prev === type ? null : type;
 
                     if (newFilter === 'dividend') {
+                        // Do not briefly show the previous seven-day dividend data
+                        // while the today-only request is in flight.
+                        setAllData([]);
                         setFilterBody('All');
                         setFilterCategory('All');
                         setFilterFromDate(todayISO);
