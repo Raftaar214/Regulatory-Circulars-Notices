@@ -1936,6 +1936,10 @@ def get_all_notices(
     raw_notices = [
         n for n in all_notices
         if from_iso <= (n.get("date") or "") <= to_iso
+        and not (
+            n.get("type") == "dividend"
+            and from_d != to_d
+        )
     ]
 
     # Rebuild source_status counts for the filtered window

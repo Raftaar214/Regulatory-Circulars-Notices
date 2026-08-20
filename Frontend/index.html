@@ -494,6 +494,7 @@
                         // Do not briefly show the previous seven-day dividend data
                         // while the today-only request is in flight.
                         setAllData([]);
+                        setSourceStatus({});
                         setFilterBody('All');
                         setFilterCategory('All');
                         setFilterFromDate(todayISO);
@@ -549,7 +550,9 @@
 
             const sourceErrors = Object.entries(sourceStatus).filter(([, s]) => s.error);
             const sourceNotes = Object.entries(sourceStatus).filter(([, s]) => s.note && !s.error);
-            const totalLive = Object.values(sourceStatus).reduce((sum, s) => sum + (s.count || 0), 0);
+            const totalLive = activeQuickFilter === 'dividend'
+                ? allData.filter(item => item.type === 'dividend').length
+                : Object.values(sourceStatus).reduce((sum, s) => sum + (s.count || 0), 0);
 
             const availableCategories = useMemo(() => {
                 return [...new Set(allData.filter(item => item.type !== 'dividend').map(item => item.category))].filter(Boolean).sort();
