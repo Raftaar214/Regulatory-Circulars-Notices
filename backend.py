@@ -2123,7 +2123,6 @@ def summarize_one(notice_id: str, force: bool = False):
 # the actual scraping/Gemini work happens in a thread executor so it never
 # blocks request handling. Single-process assumption: if this ever runs
 # behind multiple Uvicorn workers, move this loop to its own process/cron
-# job instead, or every worker will refresh + summarize independently.
 # ===========================================================================
 async def _refresh_and_summarize():
     """Scheduled cycle: scrape TODAY's data only, upsert into the Supabase
