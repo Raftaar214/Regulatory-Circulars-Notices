@@ -122,7 +122,6 @@
             'F&O Settlement & Delivery': ['physical settlement', 'auction session', 'delivery settlement', 'short delivery'],
             'Market Uptime': ['technical glitch', 'extension of trading hours'],
             'Commodity Settlement (MCX)': ['due date rate', 'due date rates', 'event based additional surveillance', 'e-asm'],
-            'Surveillance Action (ASM/GSM/ESM)': ['additional surveillance measure', 'asm', 'graded surveillance measure', 'gsm', 'enhanced surveillance measure', 'esm', 'risk reduction mode', 'rrm', 'lt-asm', 'st-asm'],
         };
 
         // TIER 2 - relevant this week: shapes what/how you'll trade soon, not urgent today
@@ -148,6 +147,7 @@
             'Membership / Compliance Admin': ['vapt report', 'software as a service', 'renewal process for registration', 'segmental surrender', 'empanel'],
             'Corporate Calendar': ['change in name of company', 'agm', 'board meeting', 'change in status of company'],
             'Investor Caution': ['caution to investors', 'caution for investors'],
+            'Surveillance Action (ASM/GSM/ESM)': ['additional surveillance measure', 'asm', 'graded surveillance measure', 'gsm', 'enhanced surveillance measure', 'esm', 'risk reduction mode', 'rrm', 'lt-asm', 'st-asm'],
             'Trading Halt / Price Band': ['suspension of trading', 'trading halt', 'circuit filter', 'price band', 'trading restriction', 'trading restrictions'],
             'Mutual Funds': ['mutual fund', 'mf margin', 'mutual fund collateral', 'mf collateral', 'approved units'],
         };
@@ -197,11 +197,12 @@
             const anyRelevantMatch = t1.score > 0 || t2.score > 0 || t3.score > 0;
 
             const isMutualFundIgnore = ignoreHit.category === 'Mutual Funds';
+            const isSurveillanceIgnore = ignoreHit.category === 'Surveillance Action (ASM/GSM/ESM)';
 
             // Recognized as not trading-relevant, and nothing relevant also
             // matched - leave it unmarked instead of forcing a P3 badge.
-            // Explicitly force ignore for Mutual Funds even if they mention collateral.
-            if (ignoreHit.score > 0 && (!anyRelevantMatch || isMutualFundIgnore)) {
+            // Explicitly force ignore for Mutual Funds and Surveillance even if they mention margin.
+            if (ignoreHit.score > 0 && (!anyRelevantMatch || isMutualFundIgnore || isSurveillanceIgnore)) {
                 return { ...item, priority: null, category: ignoreHit.category || item.category || 'Administrative' };
             }
 
