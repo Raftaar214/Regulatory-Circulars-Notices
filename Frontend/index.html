@@ -122,6 +122,7 @@
             'F&O Settlement & Delivery': ['physical settlement', 'auction session', 'delivery settlement', 'short delivery'],
             'Market Uptime': ['technical glitch', 'extension of trading hours'],
             'Commodity Settlement (MCX)': ['due date rate', 'due date rates', 'event based additional surveillance', 'e-asm'],
+            'Surveillance Action (ASM/GSM/ESM)': ['additional surveillance measure', 'asm', 'graded surveillance measure', 'gsm', 'enhanced surveillance measure', 'esm', 'risk reduction mode', 'rrm', 'lt-asm', 'st-asm'],
         };
 
         // TIER 2 - relevant this week: shapes what/how you'll trade soon, not urgent today
@@ -147,7 +148,6 @@
             'Membership / Compliance Admin': ['vapt report', 'software as a service', 'renewal process for registration', 'segmental surrender', 'empanel'],
             'Corporate Calendar': ['change in name of company', 'agm', 'board meeting', 'change in status of company'],
             'Investor Caution': ['caution to investors', 'caution for investors'],
-            'Surveillance Action (ASM/GSM/ESM)': ['additional surveillance measure', 'asm', 'graded surveillance measure', 'gsm', 'enhanced surveillance measure', 'esm', 'risk reduction mode', 'rrm', 'lt-asm', 'st-asm'],
             'Trading Halt / Price Band': ['suspension of trading', 'trading halt', 'circuit filter', 'price band', 'trading restriction', 'trading restrictions'],
             'Mutual Funds': ['mutual fund', 'mf margin', 'mutual fund collateral', 'mf collateral', 'approved units'],
         };
@@ -433,6 +433,8 @@
 
                         return matchesTitle && matchesBody && matchesCategory;
                     });
+                    
+                    filtered.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0));
                 }
                 return filtered;
             }, [allData, filterTitle, filterBody, filterCategory, activeQuickFilter]);
