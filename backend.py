@@ -1106,7 +1106,7 @@ def fetch_sebi_whats_new(from_date: datetime.date, to_date: datetime.date) -> Di
             else:
                 payload["next"] = "n"
                 payload["nextValue"] = next_value
-                payload["doDirect"] = str(page)
+                payload["doDirect"] = str(page + 1)
 
             resp = session.post(
                 ajax_url,
