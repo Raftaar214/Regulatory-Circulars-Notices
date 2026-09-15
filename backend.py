@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 import os
 import logging
@@ -109,6 +110,8 @@ BROWSER_HEADERS = {
 
 REQUEST_TIMEOUT = 45
 INTER_REQUEST_DELAY = 0.4
+MAX_DOCUMENT_TEXT_CHARS = 12000
+SCRAPE_WORKERS = max(1, min(int(os.environ.get("SCRAPE_WORKERS", "4")), 10))
 
 app = FastAPI(title="Regulatory Notices Dashboard API")
 
@@ -184,6 +187,7 @@ def _latest_refresh_timestamp(last_refresh_at: Optional[str], max_scraped: Optio
 
 # Top-level SQL columns (everything else goes in `data` jsonb)
 _NOTICE_TOP_COLS = {"id", "date", "body", "type", "_source_key"}
+_NOTICE_TRANSIENT_FIELDS = {"document_text"}
 
 def _notice_to_row(n: Dict) -> Dict:
     """Convert a notice dict into the 4-column + JSONB hybrid Supabase row.
@@ -195,7 +199,7 @@ def _notice_to_row(n: Dict) -> Dict:
     ntype = n.get("type") or "notice"
     data: Dict = {}
     for k, v in n.items():
-        if k in _NOTICE_TOP_COLS:  # already a real SQL column or internal tag
+        if k in _NOTICE_TOP_COLS or k in _NOTICE_TRANSIENT_FIELDS:
             continue
         if v is None or v == "":
             continue
@@ -221,6 +225,7 @@ def _row_to_notice(row: Dict) -> Dict:
     notice["body"] = row.get("body", notice.get("body", ""))
     notice["type"] = row.get("type", notice.get("type", "notice"))
     notice["scraped_at"] = row.get("scraped_at")
+    notice.pop("document_text", None)
     return notice
 
 def _notices_upsert(notices: List[Dict]) -> int:
@@ -252,6 +257,7 @@ def _notices_upsert(notices: List[Dict]) -> int:
                 rid = row.get("id")
                 if rid in existing:
                     merged_data = dict(existing[rid])
+                    merged_data.pop("document_text", None)
                     merged_data.update(row.get("data") or {})
                     row["data"] = merged_data
                 merged_chunk.append(row)
@@ -283,7 +289,18 @@ def _notices_fetch(from_date: datetime.date, to_date: datetime.date) -> Optional
         logger.error(f"Failed to fetch: {e}")
         return None
 
-    return _wrap_notices_result(all_rows, from_date, to_date)
+    deduplicated = []
+    seen = set()
+    for notice in all_rows:
+        key = (notice.get("body"), notice.get("link"))
+        if not notice.get("link"):
+            key = (notice.get("body"), notice.get("date"), notice.get("title"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(notice)
+
+    return _wrap_notices_result(deduplicated, from_date, to_date)
 
 
 def _wrap_notices_result(notices: List[Dict], from_date: datetime.date,
@@ -341,15 +358,21 @@ def _extract_text_from_url(url: str) -> str:
         content_type = resp.headers.get("Content-Type", "").lower()
         if "pdf" in content_type or url.lower().endswith(".pdf"):
             reader = pypdf.PdfReader(io.BytesIO(resp.content))
-            text = ""
+            text_parts = []
+            text_length = 0
             for i, page in enumerate(reader.pages):
                 if i >= 5: # Limit to first 5 pages to save tokens
                     break
-                text += page.extract_text() + "\n"
-            return text.strip()
+                page_text = page.extract_text() or ""
+                remaining = MAX_DOCUMENT_TEXT_CHARS - text_length
+                if remaining <= 0:
+                    break
+                text_parts.append(page_text[:remaining])
+                text_length += len(text_parts[-1])
+            return "\n".join(text_parts).strip()
         elif "html" in content_type:
             soup = BeautifulSoup(resp.content, "lxml")
-            return soup.get_text(separator=" ", strip=True)
+            return soup.get_text(separator=" ", strip=True)[:MAX_DOCUMENT_TEXT_CHARS]
         else:
             return ""
     except Exception as e:
@@ -1176,8 +1199,11 @@ def fetch_sebi_whats_new(from_date: datetime.date, to_date: datetime.date) -> Di
 
                 seen.add(key)
 
+                stable_key = row["link"] or f'{row["date_text"]}|{row["title"]}'
+                stable_id = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:24]
+
                 notices.append({
-                    "id": f"sebi-{len(notices)}",
+                    "id": f"sebi-{stable_id}",
                     "body": "SEBI",
                     "category": row["category"],
                     "date": parsed_date or to_iso,
@@ -1820,7 +1846,7 @@ def _scrape_fresh(from_date: datetime.date, to_date: datetime.date) -> Dict:
     }
 
     sources: Dict[str, Dict] = {}
-    with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+    with ThreadPoolExecutor(max_workers=SCRAPE_WORKERS) as executor:
         future_map = {
             executor.submit(func, from_date, to_date): name
             for name, func in jobs.items()

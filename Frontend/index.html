@@ -5,6 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Regulatory Circulars & Notices - Priority & Summary</title>
+    <link rel="icon" type="image/png" href="company-logo-cropped.png">
 
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -617,9 +618,32 @@ body{
 }
 
 header{
+    position:relative;
   border-bottom:2px double var(--ink);
   padding-bottom:10px;
+    padding-right:190px;
   margin-bottom:8px;
+}
+
+.report-brand{
+    position:absolute;
+    top:0;
+    right:0;
+    display:flex;
+    align-items:center;
+    gap:8px;
+    font:600 11px Arial,sans-serif;
+}
+
+.report-brand img{
+    width:28px;
+    height:28px;
+    object-fit:contain;
+}
+
+.report-brand a{
+    color:var(--ink);
+    text-decoration:none;
 }
 
 h1{
@@ -817,12 +841,14 @@ footer{
                 };
 
                 const nowStr = new Date().toLocaleString('en-IN', { weekday: 'long', day: '2-digit', month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+                const reportLogoUrl = new URL('company-logo-cropped.png', window.location.href).href;
 
                 const doc = `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>RegWatch briefing</title><style>${CSS}</style></head><body>
 <div class="sheet">
-<header><h1>RegWatch — Indian Market Regulatory Briefing</h1>
+<header><div class="report-brand"><img src="${reportLogoUrl}" alt="Shree Research logo"><a href="https://www.shreeresearch.com" target="_blank">www.shreeresearch.com</a></div>
+<h1>RegWatch — Indian Market Regulatory Briefing</h1>
 <div class="meta">Shree Research · ${nowStr}</div></header>
 <div class="counts">
   <div><b>${p1.length}</b>P1 Direct Impact</div>
@@ -837,7 +863,7 @@ ${renderBlock("P3 · Peripheral", p3)}
 
                 const opt = {
                     margin: 0,
-                    filename: `Briefing_${todayStrLocal}.pdf`,
+                    filename: `Reg_Notices_${todayStrLocal}.pdf`,
                     image: {
                         type: 'jpeg',
                         quality: 1.0
@@ -895,7 +921,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                             {activeQuickFilter === 'dividend' ? (
                                                 <Icon name="banknote" className="w-4 h-4 text-emerald-600" />
                                             ) : (
-                                                <Icon name="scroll-text" className="w-4 h-4 text-indigo-600" />
+                                                <img src="company-logo-cropped.png" alt="" className="w-4 h-4 object-contain" />
                                             )}
                                             {activeQuickFilter === 'dividend' ? 'NSE Corporate Actions – Dividends' : 'Regulatory Notices'}
                                         </h1>
