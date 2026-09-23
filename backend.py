@@ -14,6 +14,8 @@ import asyncio
 import requests
 import io
 import pypdf
+import zipfile
+import csv
 
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Query, BackgroundTasks
@@ -2187,6 +2189,79 @@ async def _refresh_and_summarize():
     return status
 
 
+fno_symbols_cache = []
+
+async def _scrape_fno_symbols():
+    global fno_symbols_cache
+    logger.info("Scraping FNO symbols...")
+    try:
+        for i in range(1, 8):
+            d = datetime.datetime.now(IST_TZ) - datetime.timedelta(days=i)
+            date_str = d.strftime("%Y%m%d")
+            url = f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{date_str}_F_0000.csv.zip"
+            
+            loop = asyncio.get_event_loop()
+            
+            def _fetch(u):
+                session = _nse_warmup_session()
+                return session.get(u, timeout=REQUEST_TIMEOUT)
+
+            r = await loop.run_in_executor(None, _fetch, url)
+            
+            if r.status_code == 200:
+                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                    filename = z.namelist()[0]
+                    with z.open(filename) as f:
+                        content = f.read().decode('utf-8')
+                        reader = csv.DictReader(io.StringIO(content))
+                        symbols = set()
+                        for row in reader:
+                            if row.get('TckrSymb'):
+                                symbols.add(row['TckrSymb'])
+                        if symbols:
+                            sym_list = list(symbols)
+                            fno_symbols_cache = sym_list
+                            logger.info(f"Successfully loaded {len(sym_list)} FNO symbols from {date_str}.")
+                            
+                            if supabase_client:
+                                try:
+                                    supabase_client.table("notices").upsert({
+                                        "id": "fno_symbols_latest",
+                                        "date": d.strftime("%Y-%m-%d"),
+                                        "type": "fno_symbols",
+                                        "data": {"symbols": sym_list}
+                                    }).execute()
+                                    logger.info("Saved FNO symbols to Supabase.")
+                                except Exception as e:
+                                    logger.error(f"Failed to save FNO symbols to Supabase: {e}")
+                            return
+    except Exception as e:
+        logger.error(f"Failed to scrape FNO symbols: {e}")
+
+@app.get("/api/fno_symbols")
+async def get_fno_symbols():
+    if supabase_client:
+        try:
+            resp = supabase_client.table("notices").select("data").eq("id", "fno_symbols_latest").limit(1).execute()
+            if resp.data and len(resp.data) > 0:
+                return resp.data[0]["data"]
+        except Exception as e:
+            logger.error(f"Error reading FNO symbols from Supabase: {e}")
+            
+    global fno_symbols_cache
+    if not fno_symbols_cache:
+        await _scrape_fno_symbols()
+        
+    if supabase_client:
+        try:
+            resp = supabase_client.table("notices").select("data").eq("id", "fno_symbols_latest").limit(1).execute()
+            if resp.data and len(resp.data) > 0:
+                return resp.data[0]["data"]
+        except Exception:
+            pass
+
+    return {"symbols": fno_symbols_cache}
+
 async def _scheduled_job_loop():
     await asyncio.sleep(5)  # let the app finish starting first
     
@@ -2204,6 +2279,8 @@ async def _scheduled_job_loop():
                 logger.info(f"Scheduled time reached: {now.strftime('%H:%M')} IST. Starting refresh.")
                 last_run_time = current_time
                 await _refresh_and_summarize()
+                if current_time == (8, 0):
+                    await _scrape_fno_symbols()
                 
         except Exception:
             logger.exception("Scheduled refresh/summarize cycle failed")
