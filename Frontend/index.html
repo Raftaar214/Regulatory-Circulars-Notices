@@ -235,9 +235,27 @@
         // Helper to extract dividend amount
         const extractDividendAmount = (subject) => {
             if (!subject) return "";
-            const match = subject.match(/(?:Rs|Re).?s*([d.]+)/i);
-            if (match && match[1]) {
-                return `₹${match[1]}`;
+            
+            // Ignore bonuses, splits, and face value changes
+            if (/(bonus|split|face value|sub-division)/i.test(subject)) {
+                return "—";
+            }
+            
+            const regex = /(?:Rs|Re)\.?\s*([\d.]+)/gi;
+            let match;
+            let total = 0.0;
+            let found = false;
+            
+            while ((match = regex.exec(subject)) !== null) {
+                if (match[1]) {
+                    total += parseFloat(match[1]);
+                    found = true;
+                }
+            }
+            
+            if (found) {
+                // Return total with up to 2 decimal places if needed
+                return `₹${parseFloat(total.toFixed(2))}`;
             }
             return subject;
         };

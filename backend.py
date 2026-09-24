@@ -1349,12 +1349,20 @@ def _extract_dividend_amount(subject: str) -> Optional[float]:
     Common formats: 'Rs 125/-', 'Rs.5.50', 'Re 1/-', 'Rs 0.50 Per Share'."""
     if not subject:
         return None
-    m = re.search(r'(?:Rs\.?|Re\.?)\s*([\d.]+)', subject, re.IGNORECASE)
-    if m:
-        try:
-            return float(m.group(1))
-        except ValueError:
-            pass
+        
+    # Ignore splits and bonuses
+    if re.search(r'(bonus|split|face value|sub-division)', subject, re.IGNORECASE):
+        return None
+        
+    matches = re.findall(r'(?:Rs\.?|Re\.?)\s*([\d.]+)', subject, re.IGNORECASE)
+    if matches:
+        total = 0.0
+        for m in matches:
+            try:
+                total += float(m)
+            except ValueError:
+                pass
+        return total if total > 0 else None
     return None
 
 
