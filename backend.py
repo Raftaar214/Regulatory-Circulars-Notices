@@ -113,7 +113,20 @@ BROWSER_HEADERS = {
 REQUEST_TIMEOUT = 45
 INTER_REQUEST_DELAY = 0.4
 MAX_DOCUMENT_TEXT_CHARS = 12000
-SCRAPE_WORKERS = max(1, min(int(os.environ.get("SCRAPE_WORKERS", "4")), 10))
+# Lowered from 4 → 2. Each worker can hold a whole PDF (plus pypdf's object
+# graph, typically 5-10x the file size) in RAM at once, so concurrency here
+# multiplies peak memory. 2 keeps us comfortably inside a 512MB instance.
+SCRAPE_WORKERS = max(1, min(int(os.environ.get("SCRAPE_WORKERS", "2")), 10))
+
+# Hard ceiling on any single document we download for summarization. Exchange
+# annexures / enforcement orders are occasionally tens of MB; loading one of
+# those into RAM (and handing it to pypdf) is what was OOM-killing the
+# instance. Anything larger is skipped - the title alone still gets summarized.
+MAX_DOCUMENT_BYTES = int(os.environ.get("MAX_DOCUMENT_BYTES", str(10 * 1024 * 1024)))
+
+# Rows stored in the `notices` table that are app state, not real notices.
+# They must never be shown to visitors or sent to Gemini.
+NON_NOTICE_TYPES = {"fno_symbols"}
 
 app = FastAPI(title="Regulatory Notices Dashboard API")
 
@@ -243,6 +256,20 @@ def _notices_upsert(notices: List[Dict]) -> int:
     rows = [_notice_to_row(n) for n in notices if n.get("id")]
     if not rows: return 0
 
+    # Collapse duplicate ids before sending. Postgres rejects a whole batch
+    # with "ON CONFLICT DO UPDATE command cannot affect row a second time"
+    # (SQLSTATE 21000) if the same primary key appears twice in one statement,
+    # so a single repeated notice used to lose the other ~99 rows in its chunk.
+    # Sources do legitimately repeat a notice across paginated responses over a
+    # wide date window, so keep the last occurrence and move on.
+    _by_id: Dict[str, Dict] = {}
+    for r in rows:
+        _by_id[r["id"]] = r
+    if len(_by_id) != len(rows):
+        logger.info("Upsert: collapsed %d duplicate id(s) within this batch.",
+                    len(rows) - len(_by_id))
+    rows = list(_by_id.values())
+
     upserted = 0
     for i in range(0, len(rows), 100):
         chunk = rows[i:i+100]
@@ -271,6 +298,38 @@ def _notices_upsert(notices: List[Dict]) -> int:
 
     return upserted
 
+def _existing_summary_ids(ids: List[str]) -> set:
+    """Return the subset of `ids` that ALREADY have a current AI summary stored.
+
+    This is what makes the scheduled cycle incremental. `_scrape_fresh` returns
+    freshly-scraped dicts that carry no `summary` field (summaries live in
+    Supabase, not at the source), so filtering scraped notices on
+    `not n.get("summary")` marked *every* notice as pending and re-sent the whole
+    day to Gemini on all 6 daily runs - re-downloading every PDF each time.
+    Asking the DB which ids are already done is the fix.
+    """
+    if not supabase_client or not ids:
+        return set()
+
+    done = set()
+    try:
+        # Chunked so the `in_` filter / URL length stays sane.
+        for i in range(0, len(ids), 200):
+            chunk = ids[i:i + 200]
+            resp = supabase_client.table("notices").select("id,data").in_("id", chunk).execute()
+            for row in (resp.data or []):
+                data = row.get("data") or {}
+                if data.get("summary") and data.get("summary_prompt_version") == SUMMARY_PROMPT_VERSION:
+                    done.add(row.get("id"))
+    except Exception as e:
+        # On error return nothing: we'd rather re-summarize than silently skip
+        # a genuinely new notice.
+        logger.error(f"Failed to check existing summaries: {e}")
+        return set()
+
+    return done
+
+
 def _notices_fetch(from_date: datetime.date, to_date: datetime.date) -> Optional[Dict]:
     """Fetch notices from the hybrid Supabase table."""
     from_iso, to_iso = from_date.isoformat(), to_date.isoformat()
@@ -290,6 +349,10 @@ def _notices_fetch(from_date: datetime.date, to_date: datetime.date) -> Optional
     except Exception as e:
         logger.error(f"Failed to fetch: {e}")
         return None
+
+    # Drop app-state rows (e.g. the F&O symbol list). They live in this table
+    # for convenience but are not notices and must never reach a visitor.
+    all_rows = [r for r in all_rows if r.get("type") not in NON_NOTICE_TYPES]
 
     deduplicated = []
     seen = set()
@@ -348,38 +411,75 @@ _SUMMARY_RUNNING = False
 _SUMMARY_RUN_LOCK = threading.Lock()
 
 def _extract_text_from_url(url: str) -> str:
-    """Download a document (PDF or HTML) and extract its text."""
+    """Download a document (PDF or HTML) and extract its text.
+
+    Memory-guarded: the response is size-capped at MAX_DOCUMENT_BYTES before
+    anything is parsed. Previously this did `resp.content` with no limit and
+    handed the whole thing to pypdf, which builds an in-memory object graph
+    several times the file size - a single large annexure PDF was enough to
+    OOM-kill a 512MB instance. The "first 5 pages" cap below saves Gemini
+    tokens, not memory; the byte cap here is what protects the process.
+    """
     if not url:
         return ""
+
+    resp = None
+    raw = None
     try:
         s = new_session()
         s.headers.update(BROWSER_HEADERS)
         resp = s.get(url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
 
+        # Cheap pre-check: if the server tells us the size up front, bail out
+        # before reading a single byte of body.
+        declared = resp.headers.get("Content-Length")
+        if declared and declared.isdigit() and int(declared) > MAX_DOCUMENT_BYTES:
+            logger.info("Skipping oversized document (%.1f MB > %.1f MB cap): %s",
+                        int(declared) / 1048576, MAX_DOCUMENT_BYTES / 1048576, url)
+            return ""
+
+        raw = resp.content
+        if len(raw) > MAX_DOCUMENT_BYTES:
+            logger.info("Skipping oversized document (%.1f MB > %.1f MB cap): %s",
+                        len(raw) / 1048576, MAX_DOCUMENT_BYTES / 1048576, url)
+            return ""
+
         content_type = resp.headers.get("Content-Type", "").lower()
         if "pdf" in content_type or url.lower().endswith(".pdf"):
-            reader = pypdf.PdfReader(io.BytesIO(resp.content))
-            text_parts = []
-            text_length = 0
-            for i, page in enumerate(reader.pages):
-                if i >= 5: # Limit to first 5 pages to save tokens
-                    break
-                page_text = page.extract_text() or ""
-                remaining = MAX_DOCUMENT_TEXT_CHARS - text_length
-                if remaining <= 0:
-                    break
-                text_parts.append(page_text[:remaining])
-                text_length += len(text_parts[-1])
-            return "\n".join(text_parts).strip()
+            reader = None
+            try:
+                reader = pypdf.PdfReader(io.BytesIO(raw))
+                text_parts = []
+                text_length = 0
+                for i, page in enumerate(reader.pages):
+                    if i >= 5: # Limit to first 5 pages to save tokens
+                        break
+                    page_text = page.extract_text() or ""
+                    remaining = MAX_DOCUMENT_TEXT_CHARS - text_length
+                    if remaining <= 0:
+                        break
+                    text_parts.append(page_text[:remaining])
+                    text_length += len(text_parts[-1])
+                return "\n".join(text_parts).strip()
+            finally:
+                # pypdf holds the decoded page objects; drop them promptly so
+                # the allocator can reuse the arena for the next document.
+                del reader
         elif "html" in content_type:
-            soup = BeautifulSoup(resp.content, "lxml")
-            return soup.get_text(separator=" ", strip=True)[:MAX_DOCUMENT_TEXT_CHARS]
+            soup = BeautifulSoup(raw, "lxml")
+            try:
+                return soup.get_text(separator=" ", strip=True)[:MAX_DOCUMENT_TEXT_CHARS]
+            finally:
+                del soup
         else:
             return ""
     except Exception as e:
         logger.warning(f"Failed to extract text from {url}: {e}")
         return ""
+    finally:
+        del raw
+        del resp
 
 
 class GeminiRateLimited(Exception):
@@ -504,16 +604,30 @@ def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
     if not GEMINI_API_KEY:
         return {"generated": 0, "pending": len(notices)}
 
-    pending = [
+    # App-state rows (the F&O symbol list) are not notices - never summarize
+    # them. One had already leaked through and Gemini wrote a nonsense summary
+    # for it ("The exchange has not provided any text or details...").
+    candidates = [
         n for n in notices
-        if n.get("id") and (
-            not n.get("summary")
-            or n.get("summary_prompt_version") != SUMMARY_PROMPT_VERSION
-        )
+        if n.get("id") and n.get("type") not in NON_NOTICE_TYPES
     ]
 
+    # Anything already summarized in memory is obviously done.
+    maybe_pending = [
+        n for n in candidates
+        if not n.get("summary")
+        or n.get("summary_prompt_version") != SUMMARY_PROMPT_VERSION
+    ]
+
+    # Freshly-scraped notices never carry a summary, so the in-memory check
+    # above can't tell "new" from "already done in a previous cycle". Ask
+    # Supabase which ids are genuinely outstanding.
+    already_done = _existing_summary_ids([n["id"] for n in maybe_pending])
+    pending = [n for n in maybe_pending if n["id"] not in already_done]
+
     if not pending:
-        logger.info("Summary pass: nothing new (%d notices already covered).", len(notices))
+        logger.info("Summary pass: nothing new (%d notice(s) checked, %d already summarized).",
+                    len(candidates), len(already_done))
         return {"generated": 0, "pending": 0}
 
     logger.info("Summary pass: %d new notice(s) need AI summaries (model=%s).", len(pending), GEMINI_MODEL)
@@ -565,7 +679,7 @@ def _run_summary_pass(notices: List[Dict]) -> Dict[str, int]:
 
         time.sleep(SUMMARY_CHUNK_DELAY_SECONDS)
 
-    still_pending = sum(1 for n in notices if n.get("id") and not n.get("summary"))
+    still_pending = max(0, len(pending) - generated)
     logger.info("Summary pass complete: %d generated, %d still pending.", generated, still_pending)
 
     return {"generated": generated, "pending": still_pending}
@@ -602,6 +716,21 @@ def _maybe_kickoff_summary_pass(notices: List[Dict]):
     if not _try_start_summary_pass():
         return
     threading.Thread(target=_run_summary_pass_guarded, args=(notices,), daemon=True).start()
+
+
+def _stable_id(*parts: Any) -> str:
+    """Content-derived id for sources that give us no stable upstream number.
+
+    Several scrapers used to fall back to the row's *position* in the result
+    list (e.g. f"bse-pr-{len(notices)}"). Those lists are rolling, so today's
+    `bse-pr-0` is a completely different press release from yesterday's - but
+    they collided on the same primary key. `_notices_upsert` then merged the
+    new title onto the OLD summary, leaving rows whose summary described a
+    different notice entirely. Hashing the content instead keeps an id tied to
+    the thing it identifies.
+    """
+    key = "|".join(_clean(p) for p in parts if p)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
 
 
 def _clean(text: Optional[str]) -> str:
@@ -873,10 +1002,12 @@ def fetch_nse_press_releases(from_date: datetime.date, to_date: datetime.date) -
                 elif link.startswith("/"):
                     link = NSE_BASE + link
 
+                pr_date = parsed_date or to_date.isoformat()
                 notices.append({
-                    "id": f"nse-pr-{row.get('id') or len(notices)}",
+                    # Prefer NSE's own row id; fall back to content, never position.
+                    "id": f"nse-pr-{row.get('id') or _stable_id(link, title, pr_date)}",
                     "body": "NSE", "category": "Press Release",
-                    "date": parsed_date or to_date.isoformat(),
+                    "date": pr_date,
                     "title": title,
                     "link": link,
                 })
@@ -940,10 +1071,12 @@ def fetch_bse_notices(from_date: datetime.date, to_date: datetime.date) -> Dict:
                 else:
                     link = f"{BSE_WWW}/markets/marketinfo/noticescirculars?id=0"
                 notice_no = _get_first(row, "Notice_id", "Notice_no", "NOTICENO", "NoticeNo", "NOTICE_NO", "Id")
+                cir_date = _parse_date_loose(raw_date) or to_date.isoformat()
                 notices.append({
-                    "id": f"bse-cir-{notice_no or len(notices)}",
+                    # Prefer BSE's own notice number; fall back to content, never position.
+                    "id": f"bse-cir-{notice_no or _stable_id(link, title, cir_date)}",
                     "body": "BSE", "category": "Circular",
-                    "date": _parse_date_loose(raw_date) or to_date.isoformat(),
+                    "date": cir_date,
                     "title": title, "link": link,
                 })
             if rows and not notices:
@@ -1001,10 +1134,11 @@ def fetch_bse_press_releases(from_date: datetime.date, to_date: datetime.date) -
                     link = f"{BSE_WWW}/xml-data/corpfiling/AttachLive/{raw_link}"
                 else:
                     link = f"{BSE_WWW}/markets/mediainfo/mediarelease"
+                pr_date = parsed_date or to_date.isoformat()
                 notices.append({
-                    "id": f"bse-pr-{len(notices)}",
+                    "id": f"bse-pr-{_stable_id(link, title, pr_date)}",
                     "body": "BSE", "category": "Press Release",
-                    "date": parsed_date or to_date.isoformat(),
+                    "date": pr_date,
                     "title": title, "link": link,
                 })
             time.sleep(INTER_REQUEST_DELAY)
@@ -1816,7 +1950,7 @@ def fetch_ifsca(from_date: datetime.date, to_date: datetime.date) -> Dict:
                 continue
 
             notices.append({
-                "id": f"ifsca-{len(notices)+1}",
+                "id": f"ifsca-{_stable_id(link, title, date)}",
                 "body": "IFSCA",
                 "category": category,
                 "date": date,
@@ -1913,14 +2047,20 @@ def _build_dataset(from_date: datetime.date, to_date: datetime.date,
     global CACHE_REFRESHING, LAST_REFRESHED_AT
 
     # -------------------------------------------------------
-    # Normal page load: serve from Supabase / RAM cache
+    # Normal page load: serve from Supabase, and ONLY from Supabase.
+    #
+    # This path is strictly read-only. It used to fall through to a live
+    # scrape when Supabase returned nothing, which meant a visitor request
+    # could kick off all 10 scrapers (and the PDF downloads behind them) on
+    # the web instance. Scraping now happens exclusively in the scheduler.
     # -------------------------------------------------------
     if not force_refresh:
         result = _notices_fetch(from_date, to_date)
         if result is not None:
             return result
-        # Nothing in Supabase/cache yet → fall through to a live scrape
-        logger.info("No cached notices found; falling back to live scrape.")
+        logger.warning("Supabase read returned nothing; serving an empty set "
+                       "(visitor requests never trigger a scrape).")
+        return _wrap_notices_result([], from_date, to_date)
 
     # -------------------------------------------------------
     # Guard against concurrent refreshes
@@ -1984,6 +2124,7 @@ def get_all_notices(
     raw_notices = [
         n for n in all_notices
         if from_iso <= (n.get("date") or "") <= to_iso
+        and n.get("type") not in NON_NOTICE_TYPES
         and not (
             n.get("type") == "dividend"
             and from_d != to_d
@@ -2001,8 +2142,9 @@ def get_all_notices(
     decorated = raw_notices
     have = sum(1 for d in decorated if d.get("summary"))
 
-    # Fire-and-forget: summarize any notices that don't have a summary yet
-    _maybe_kickoff_summary_pass(raw_notices)
+    # NOTE: no summary pass is kicked off here on purpose. This endpoint is a
+    # pure Supabase read. Summaries are generated only by the scheduler, so a
+    # visitor can never trigger PDF downloads or Gemini calls on this instance.
 
     # Remove internal tags before sending to frontend
     for d in decorated:
@@ -2199,74 +2341,122 @@ async def _refresh_and_summarize():
 
 fno_symbols_cache = []
 
-async def _scrape_fno_symbols():
+FNO_SYMBOLS_ROW_ID = "fno_symbols_latest"
+
+
+def _fno_stored_date() -> Optional[str]:
+    """Which bhavcopy date the currently-stored F&O list was built from."""
+    if not supabase_client:
+        return None
+    try:
+        resp = (supabase_client.table("notices")
+                .select("date").eq("id", FNO_SYMBOLS_ROW_ID).limit(1).execute())
+        if resp.data:
+            return resp.data[0].get("date")
+    except Exception as e:
+        logger.error(f"Failed to read stored FNO date: {e}")
+    return None
+
+
+def _parse_fno_symbols(zip_bytes: bytes) -> List[str]:
+    """Pull the ticker column out of a bhavcopy zip without holding several
+    full copies of the CSV in memory at once.
+
+    The old version did `f.read().decode()` then wrapped that string in a
+    StringIO and handed it to DictReader - keeping the zip bytes, the whole
+    decoded CSV, and a second copy of it alive simultaneously. Streaming the
+    member line-by-line keeps only one row in memory at a time.
+    """
+    symbols = set()
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        filename = z.namelist()[0]
+        with z.open(filename) as f:
+            reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8"))
+            for row in reader:
+                tkr = row.get("TckrSymb")
+                if tkr:
+                    symbols.add(tkr)
+    return sorted(symbols)
+
+
+async def _scrape_fno_symbols(force: bool = False):
+    """Store the most recent available bhavcopy's F&O symbol list.
+
+    Walks back from yesterday until it finds a bhavcopy that exists (skipping
+    weekends/holidays), then writes it to a single Supabase row - so today's
+    list replaces yesterday's rather than accumulating. No-ops when the stored
+    list is already the newest available one, so it can run in every scheduler
+    slot without re-downloading the same file six times a day.
+    """
     global fno_symbols_cache
-    logger.info("Scraping FNO symbols...")
+
+    stored_date = None if force else _fno_stored_date()
+    loop = asyncio.get_event_loop()
+
+    def _fetch(u):
+        session = _nse_warmup_session()
+        return session.get(u, timeout=REQUEST_TIMEOUT)
+
     try:
         for i in range(1, 8):
             d = datetime.datetime.now(IST_TZ) - datetime.timedelta(days=i)
+            iso_date = d.strftime("%Y-%m-%d")
+
+            # The newest bhavcopy we'd find is the one we already have → stop.
+            if stored_date and iso_date == stored_date:
+                logger.info("F&O symbols already current (bhavcopy %s) - skipping download.", iso_date)
+                return
+
             date_str = d.strftime("%Y%m%d")
             url = f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{date_str}_F_0000.csv.zip"
-            
-            loop = asyncio.get_event_loop()
-            
-            def _fetch(u):
-                session = _nse_warmup_session()
-                return session.get(u, timeout=REQUEST_TIMEOUT)
 
             r = await loop.run_in_executor(None, _fetch, url)
-            
-            if r.status_code == 200:
-                with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                    filename = z.namelist()[0]
-                    with z.open(filename) as f:
-                        content = f.read().decode('utf-8')
-                        reader = csv.DictReader(io.StringIO(content))
-                        symbols = set()
-                        for row in reader:
-                            if row.get('TckrSymb'):
-                                symbols.add(row['TckrSymb'])
-                        if symbols:
-                            sym_list = list(symbols)
-                            fno_symbols_cache = sym_list
-                            logger.info(f"Successfully loaded {len(sym_list)} FNO symbols from {date_str}.")
-                            
-                            if supabase_client:
-                                try:
-                                    supabase_client.table("notices").upsert({
-                                        "id": "fno_symbols_latest",
-                                        "date": d.strftime("%Y-%m-%d"),
-                                        "type": "fno_symbols",
-                                        "data": {"symbols": sym_list}
-                                    }).execute()
-                                    logger.info("Saved FNO symbols to Supabase.")
-                                except Exception as e:
-                                    logger.error(f"Failed to save FNO symbols to Supabase: {e}")
-                            return
+            if r.status_code != 200:
+                continue
+
+            try:
+                sym_list = await loop.run_in_executor(None, _parse_fno_symbols, r.content)
+            finally:
+                del r
+
+            if not sym_list:
+                continue
+
+            fno_symbols_cache = sym_list
+            logger.info("Loaded %d F&O symbols from bhavcopy %s.", len(sym_list), iso_date)
+
+            if supabase_client:
+                try:
+                    # Single fixed id → the previous day's list is replaced,
+                    # never accumulated.
+                    supabase_client.table("notices").upsert({
+                        "id": FNO_SYMBOLS_ROW_ID,
+                        "date": iso_date,
+                        "type": "fno_symbols",
+                        "data": {"symbols": sym_list, "bhavcopy_date": iso_date},
+                    }).execute()
+                    logger.info("Saved F&O symbols (bhavcopy %s) to Supabase.", iso_date)
+                except Exception as e:
+                    logger.error(f"Failed to save FNO symbols to Supabase: {e}")
+            return
+
+        logger.warning("No bhavcopy found in the last 7 days - F&O list left unchanged.")
     except Exception as e:
         logger.error(f"Failed to scrape FNO symbols: {e}")
 
+
 @app.get("/api/fno_symbols")
 async def get_fno_symbols():
+    """Read-only. Never downloads a bhavcopy on a visitor request - the
+    scheduler is the only writer."""
     if supabase_client:
         try:
-            resp = supabase_client.table("notices").select("data").eq("id", "fno_symbols_latest").limit(1).execute()
+            resp = (supabase_client.table("notices")
+                    .select("data").eq("id", FNO_SYMBOLS_ROW_ID).limit(1).execute())
             if resp.data and len(resp.data) > 0:
                 return resp.data[0]["data"]
         except Exception as e:
             logger.error(f"Error reading FNO symbols from Supabase: {e}")
-            
-    global fno_symbols_cache
-    if not fno_symbols_cache:
-        await _scrape_fno_symbols()
-        
-    if supabase_client:
-        try:
-            resp = supabase_client.table("notices").select("data").eq("id", "fno_symbols_latest").limit(1).execute()
-            if resp.data and len(resp.data) > 0:
-                return resp.data[0]["data"]
-        except Exception:
-            pass
 
     return {"symbols": fno_symbols_cache}
 
@@ -2287,8 +2477,11 @@ async def _scheduled_job_loop():
                 logger.info(f"Scheduled time reached: {now.strftime('%H:%M')} IST. Starting refresh.")
                 last_run_time = current_time
                 await _refresh_and_summarize()
-                if current_time == (8, 0):
-                    await _scrape_fno_symbols()
+                # Runs every slot but downloads nothing when the stored list is
+                # already the newest available bhavcopy, so a failed 8am run
+                # gets picked up later in the day instead of leaving the list
+                # stale until tomorrow.
+                await _scrape_fno_symbols()
                 
         except Exception:
             logger.exception("Scheduled refresh/summarize cycle failed")
