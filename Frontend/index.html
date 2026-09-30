@@ -346,6 +346,13 @@
             const [pageInput, setPageInput] = useState('1');
             const [ltpToast, setLtpToast] = useState(null);
 
+            // Forthcoming results (F&O only). Served by its own read-only
+            // endpoint rather than /api/notices, so it has its own state.
+            const [resultData, setResultData] = useState([]);
+            const [resultWindow, setResultWindow] = useState(null);
+            const [resultLoading, setResultLoading] = useState(false);
+            const [resultError, setResultError] = useState(null);
+
             useEffect(() => {
                 setPageInput(page.toString());
             }, [page]);
@@ -392,7 +399,18 @@
                     const response = await fetch(`${API_BASE}/api/notices?${params.toString()}`);
 
                     if (!response.ok) {
-                        throw new Error(`Backend responded with ${response.status}`);
+                        // The backend answered - it just rejected the request.
+                        // Surface its reason (e.g. a mistyped year) instead of
+                        // letting this fall through to "can't reach the backend",
+                        // which sends people to check a server that is running.
+                        let detail = "";
+                        try {
+                            const errJson = await response.json();
+                            detail = errJson && errJson.detail ? errJson.detail : "";
+                        } catch (_) { /* non-JSON error body */ }
+                        const err = new Error(detail || `Backend responded with ${response.status}`);
+                        err.fromServer = true;
+                        throw err;
                     }
 
                     const json = await response.json();
@@ -412,8 +430,13 @@
                     }
 
                 } catch (error) {
-                    console.error("Failed to reach backend:", error);
-                    setConnectionError(`Can't reach the backend at ${API_BASE}. Make sure it's running.`);
+                    if (error && error.fromServer) {
+                        console.warn("Backend rejected the request:", error.message);
+                        setConnectionError(error.message);
+                    } else {
+                        console.error("Failed to reach backend:", error);
+                        setConnectionError(`Can't reach the backend at ${API_BASE}. Make sure it's running.`);
+                    }
                     setAllData([]);
                     setSourceStatus({});
                 } finally {
@@ -425,6 +448,59 @@
             useEffect(() => {
                 loadData(false);
             }, [appliedDateRange.fromDate, appliedDateRange.toDate]);
+
+            // "2026-10-08" -> "08 Oct 2026". Parsed as parts rather than
+            // new Date(str) so the plain date isn't shifted by the timezone.
+            const fmtResultDate = (iso) => {
+                if (!iso) return '';
+                const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number);
+                if (!y || !m || !d) return iso;
+                return new Date(y, m - 1, d).toLocaleDateString('en-GB', {
+                    day: '2-digit', month: 'short', year: 'numeric'
+                });
+            };
+
+            // Forthcoming results. The server defaults the window to
+            // today .. today + 1 month, so past dates fall off on their own as
+            // the date advances - nothing to reset on the client.
+            const loadResults = async () => {
+                setResultLoading(true);
+                setResultError(null);
+                try {
+                    const response = await fetch(`${API_BASE}/api/results`);
+                    if (!response.ok) {
+                        let detail = "";
+                        try {
+                            const errJson = await response.json();
+                            detail = errJson && errJson.detail ? errJson.detail : "";
+                        } catch (_) { /* non-JSON error body */ }
+                        throw new Error(detail || `Backend responded with ${response.status}`);
+                    }
+                    const json = await response.json();
+                    setResultData(json.data || []);
+                    setResultWindow({ from: json.from_date, to: json.to_date });
+                } catch (error) {
+                    console.error("Failed to load results:", error);
+                    setResultError(error.message || "Could not load results.");
+                    setResultData([]);
+                } finally {
+                    setResultLoading(false);
+                }
+            };
+
+            // Fetch only when the Result view is actually opened.
+            useEffect(() => {
+                if (activeQuickFilter === 'result') loadResults();
+            }, [activeQuickFilter]);
+
+            // Client-side search over the already-loaded window.
+            const displayedResults = useMemo(() => {
+                const q = filterTitle.trim().toLowerCase();
+                if (!q) return resultData;
+                return resultData.filter(r =>
+                    (r.symbol || '').toLowerCase().includes(q) ||
+                    (r.company || '').toLowerCase().includes(q));
+            }, [resultData, filterTitle]);
 
             // AI summaries are generated in the background on the server (hourly,
             // plus right after any fetch) - light polling here just picks up
@@ -573,6 +649,14 @@
                         setFilterFromDate(sevenDaysAgoISO);
                         setFilterToDate(todayISO);
                         setAppliedDateRange({ fromDate: sevenDaysAgoISO, toDate: todayISO });
+                    }
+
+                    if (newFilter === 'result') {
+                        // The results view has its own server-side window, so the
+                        // notice filters don't apply to it.
+                        setFilterBody('All');
+                        setFilterCategory('All');
+                        setPage(1);
                     }
 
                     return newFilter;
@@ -985,14 +1069,20 @@ ${renderBlock("P3 · Peripheral", p3)}
                                         <h1 className="text-base font-bold text-slate-800 flex items-center gap-1.5">
                                             {(activeQuickFilter === 'dividend_split_bonus') ? (
                                                 <Icon name="banknote" className="w-4 h-4 text-emerald-600" />
+                                            ) : (activeQuickFilter === 'result') ? (
+                                                <Icon name="calendar-clock" className="w-4 h-4 text-violet-600" />
                                             ) : (
                                                 <img src="company-logo-cropped.png" alt="" className="w-4 h-4 object-contain" />
                                             )}
-                                            {(activeQuickFilter === 'dividend_split_bonus') ? 'NSE Corporate Actions' : 'Regulatory Notices'}
+                                            {(activeQuickFilter === 'dividend_split_bonus') ? 'NSE Corporate Actions'
+                                                : (activeQuickFilter === 'result') ? 'Forthcoming Results'
+                                                : 'Regulatory Notices'}
                                         </h1>
                                         <p className="text-slate-500 text-xs mt-0.5">
                                             {(activeQuickFilter === 'dividend_split_bonus')
                                                 ? 'Latest dividend announcements sorted by Ex-Date.'
+                                                : (activeQuickFilter === 'result')
+                                                ? `Upcoming result dates for F&O stocks${resultWindow ? ` · ${fmtResultDate(resultWindow.from)} to ${fmtResultDate(resultWindow.to)}` : ''}.`
                                                 : 'Live circulars and notices scored by priority relevance.'}
                                         </p>
                                     </div>
@@ -1040,6 +1130,17 @@ ${renderBlock("P3 · Peripheral", p3)}
                                             <Icon name="banknote" className="w-3 h-3" /> Dividend / Split / Bonus
                                         </button>
 
+                                        <button
+                                            onClick={() => toggleQuickFilter('result')}
+                                            title="Forthcoming results for F&O stocks (next 1 month)"
+                                            className={`text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] ${activeQuickFilter === 'result'
+                                                ? 'bg-violet-600 text-white shadow-sm border border-violet-600'
+                                                : 'bg-violet-50 text-violet-700 hover:bg-violet-100 border border-violet-200'
+                                                } `}
+                                        >
+                                            <Icon name="calendar-clock" className="w-3 h-3" /> Result
+                                        </button>
+
                                         <div className="w-px h-3.5 bg-slate-300 mx-0.5 hidden sm:block"></div>
 
                                         <button
@@ -1069,13 +1170,20 @@ ${renderBlock("P3 · Peripheral", p3)}
 
 
 
-                            {!connectionError && !isLoading && (
+                            {activeQuickFilter === 'result' ? (
+                                !resultLoading && !resultError && (
+                                    <p className="mt-1 text-[11px] text-slate-400">
+                                        {displayedResults.length} F&amp;O stock{displayedResults.length === 1 ? '' : 's'} reporting
+                                        {resultWindow ? ` • ${fmtResultDate(resultWindow.from)} to ${fmtResultDate(resultWindow.to)}` : ''}
+                                    </p>
+                                )
+                            ) : (!connectionError && !isLoading && (
                                 <p className="mt-1 text-[11px] text-slate-400">
                                     {totalLive} live rows fetched{fetchedAt ? ` • last updated ${new Date(fetchedAt).toLocaleString("en-IN", { timeZone: "Asia/Kolkata" })} ` : ''}
                                     {summaryStatus && summaryStatus.model ? ` • AI summaries: ${summaryStatus.generated}/${summaryStatus.generated + summaryStatus.pending}` : ''
                                     }
                                 </p>
-                            )}
+                            ))}
                         </div>
 
                         {/* Filters */}
@@ -1084,7 +1192,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                 <div className="w-[200px]">
                                     <input
                                         type="text"
-                                        placeholder="Enter Title"
+                                        placeholder={activeQuickFilter === 'result' ? 'Symbol or company' : 'Enter Title'}
                                         className="w-full px-2 py-1 text-sm border border-slate-300 rounded focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all placeholder:text-slate-400 h-[30px]"
                                         value={filterTitle}
                                         onChange={(e) => setFilterTitle(e.target.value)}
@@ -1092,7 +1200,9 @@ ${renderBlock("P3 · Peripheral", p3)}
                                     />
                                 </div>
 
-                                <div className="w-[125px]">
+                                {/* The results window is set by the server (today .. +1 month),
+                                    so these date inputs don't apply to that view. */}
+                                <div className={`w-[125px] ${activeQuickFilter === 'result' ? 'hidden' : ''}`}>
                                     <input
                                         type="date"
                                         title="From Date"
@@ -1102,7 +1212,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                     />
                                 </div>
 
-                                <div className="w-[125px]">
+                                <div className={`w-[125px] ${activeQuickFilter === 'result' ? 'hidden' : ''}`}>
                                     <input
                                         type="date"
                                         title="To Date"
@@ -1112,7 +1222,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                     />
                                 </div>
 
-                                {activeQuickFilter !== 'dividend_split_bonus' && (
+                                {activeQuickFilter !== 'dividend_split_bonus' && activeQuickFilter !== 'result' && (
                                     <>
                                         <div className="w-[100px]">
                                             <select
@@ -1178,7 +1288,53 @@ ${renderBlock("P3 · Peripheral", p3)}
 
                         {/* Data Tables */}
                         <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden flex flex-col flex-1 min-h-0">
-                            {(activeQuickFilter === 'dividend_split_bonus') ? (
+                            {(activeQuickFilter === 'result') ? (
+                                <div className="overflow-auto flex-1 table-container">
+                                    <table className="w-full text-left border-collapse relative">
+                                        <thead className="sticky top-0 z-10 bg-slate-50 shadow-[0_1px_0_0_#e2e8f0]">
+                                            <tr className="text-slate-700">
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[140px]">Symbol</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm">Company</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[150px]">Result Date</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-100">
+                                            {resultLoading ? (
+                                                <tr><td colSpan="3" className="px-3 py-10 text-center text-slate-500 text-sm">Loading forthcoming results…</td></tr>
+                                            ) : resultError ? (
+                                                <tr><td colSpan="3" className="px-3 py-10 text-center text-rose-600 text-sm">{resultError}</td></tr>
+                                            ) : displayedResults.length === 0 ? (
+                                                <tr>
+                                                    <td colSpan="3" className="px-3 py-12 text-center">
+                                                        <Icon name="calendar-x" className="w-8 h-8 text-slate-300 mx-auto" />
+                                                        <p className="mt-2 text-slate-500 text-sm font-medium">No forthcoming results</p>
+                                                        <p className="text-slate-400 text-xs mt-0.5">No F&amp;O stock has a result date in this window yet.</p>
+                                                    </td>
+                                                </tr>
+                                            ) : (
+                                                displayedResults.map((row, idx) => {
+                                                    // Group header whenever the date changes.
+                                                    const prev = idx > 0 ? displayedResults[idx - 1] : null;
+                                                    const isNewDate = !prev || prev.date !== row.date;
+                                                    return (
+                                                        <tr key={row.id || `${row.symbol}-${row.date}`} className="hover:bg-violet-50/40 transition-colors">
+                                                            <td className="px-3 py-2 align-top">
+                                                                <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-violet-50 text-violet-700 border border-violet-200 whitespace-nowrap">
+                                                                    {row.symbol || '—'}
+                                                                </span>
+                                                            </td>
+                                                            <td className="px-3 py-2 text-sm text-slate-700 align-top">{row.company}</td>
+                                                            <td className={`px-3 py-2 text-sm align-top whitespace-nowrap ${isNewDate ? 'font-semibold text-slate-800' : 'text-slate-500'}`}>
+                                                                {fmtResultDate(row.date)}
+                                                            </td>
+                                                        </tr>
+                                                    );
+                                                })
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            ) : (activeQuickFilter === 'dividend_split_bonus') ? (
                                 <div className="overflow-auto flex-1 table-container">
                                     <table className="w-full text-left border-collapse relative">
                                         <thead className="sticky top-0 z-10 bg-slate-50 shadow-[0_1px_0_0_#e2e8f0]">
@@ -1418,7 +1574,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                             )}
 
                             {
-                                displayedData.length > 0 && (
+                                activeQuickFilter !== 'result' && displayedData.length > 0 && (
                                     <div className="bg-slate-50 border-t border-slate-200 px-6 py-3 flex items-center justify-between text-sm text-slate-500">
                                         <span>
                                             Showing {(page - 1) * PAGE_SIZE + 1}-{Math.min(page * PAGE_SIZE, displayedData.length)} of {displayedData.length} entries
