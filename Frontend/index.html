@@ -493,6 +493,36 @@
                 if (activeQuickFilter === 'result') loadResults();
             }, [activeQuickFilter]);
 
+            // Export exactly what the table is showing (so an active search
+            // narrows the file too), not the whole fetched window.
+            const downloadResultsCsv = () => {
+                if (!displayedResults.length) return;
+
+                // Company names carry commas, quotes and apostrophes
+                // ("Dr. Reddy's Laboratories Ltd."), so every field is quoted
+                // and inner quotes are doubled per RFC 4180.
+                const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+                const rows = [
+                    ['Symbol', 'Company', 'Result Date'],
+                    ...displayedResults.map(r => [r.symbol || '', r.company || '', fmtResultDate(r.date)])
+                ];
+                const csv = rows.map(r => r.map(esc).join(',')).join('\r\n');
+
+                // Leading BOM so Excel opens it as UTF-8 rather than mangling
+                // accented characters.
+                const blob = new Blob(['﻿' + csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = resultWindow
+                    ? `fno-results-${resultWindow.from}-to-${resultWindow.to}.csv`
+                    : 'fno-results.csv';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            };
+
             // Client-side search over the already-loaded window.
             const displayedResults = useMemo(() => {
                 const q = filterTitle.trim().toLowerCase();
@@ -1143,19 +1173,39 @@ ${renderBlock("P3 · Peripheral", p3)}
 
                                         <div className="w-px h-3.5 bg-slate-300 mx-0.5 hidden sm:block"></div>
 
-                                        <button
-                                            onClick={() => downloadBriefing(null)}
-                                            className="text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-300 shadow-sm ml-auto"
-                                            title="Export today's and yesterday's P1/P2/P3 circulars"
-                                        >
-                                            <Icon name="download" className="w-3 h-3" /> Export Briefing
-                                        </button>
-                                        <button
-                                            onClick={generateSelectedBriefing}
-                                            className="text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 shadow-sm"
-                                        >
-                                            <Icon name="check-circle" className="w-3 h-3" /> Generate Briefing ({selectedItems.size})
-                                        </button>
+                                        {activeQuickFilter === 'result' && (
+                                            <button
+                                                onClick={downloadResultsCsv}
+                                                disabled={!displayedResults.length}
+                                                title={displayedResults.length
+                                                    ? `Download these ${displayedResults.length} result(s) as CSV`
+                                                    : 'Nothing to download'}
+                                                className="text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] bg-violet-50 text-violet-700 hover:bg-violet-100 border border-violet-200 shadow-sm ml-auto disabled:opacity-40 disabled:cursor-not-allowed"
+                                            >
+                                                <Icon name="file-down" className="w-3 h-3" /> Download CSV
+                                            </button>
+                                        )}
+
+                                        {/* Both briefing actions operate on the notices
+                                            dataset, so they'd export circulars while the
+                                            results table is on screen. Hidden in that view. */}
+                                        {activeQuickFilter !== 'result' && (
+                                            <>
+                                                <button
+                                                    onClick={() => downloadBriefing(null)}
+                                                    className="text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] bg-slate-100 text-slate-700 hover:bg-slate-200 border border-slate-300 shadow-sm ml-auto"
+                                                    title="Export today's and yesterday's P1/P2/P3 circulars"
+                                                >
+                                                    <Icon name="download" className="w-3 h-3" /> Export Briefing
+                                                </button>
+                                                <button
+                                                    onClick={generateSelectedBriefing}
+                                                    className="text-[11px] font-bold px-2.5 rounded-full transition-colors flex items-center gap-1 h-[24px] bg-indigo-50 text-indigo-700 hover:bg-indigo-100 border border-indigo-200 shadow-sm"
+                                                >
+                                                    <Icon name="check-circle" className="w-3 h-3" /> Generate Briefing ({selectedItems.size})
+                                                </button>
+                                            </>
+                                        )}
                                     </div>
                                 </div>
 
