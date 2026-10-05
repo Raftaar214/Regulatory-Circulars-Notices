@@ -1,5 +1,6 @@
 import datetime
 import hashlib
+import secrets
 import json
 import os
 import logging
@@ -18,7 +19,7 @@ import zipfile
 import csv
 
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Query, BackgroundTasks, HTTPException
+from fastapi import FastAPI, Query, BackgroundTasks, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
@@ -123,6 +124,14 @@ SCRAPE_WORKERS = max(1, min(int(os.environ.get("SCRAPE_WORKERS", "2")), 10))
 # those into RAM (and handing it to pypdf) is what was OOM-killing the
 # instance. Anything larger is skipped - the title alone still gets summarized.
 MAX_DOCUMENT_BYTES = int(os.environ.get("MAX_DOCUMENT_BYTES", str(10 * 1024 * 1024)))
+
+# Shared secret for the /api/admin/* endpoints, supplied as an X-Admin-Token
+# header. These endpoints kick off full scrapes and Gemini passes - a 90-day
+# backfill runs for about an hour and is easily enough to OOM a small instance -
+# so they must not be callable by anyone who knows the URL. Deliberately fails
+# closed: with no ADMIN_TOKEN configured the endpoints are disabled outright
+# rather than left open.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 
 # Rows stored in the `notices` table that are not regulatory notices. They must
 # never appear in the notices feed or be sent to Gemini. `result` rows are
@@ -2208,10 +2217,28 @@ def get_all_notices(
         },
     }
 
+def _require_admin(token: Optional[str]) -> None:
+    """Gate the admin endpoints behind ADMIN_TOKEN.
+
+    Compared with compare_digest so a wrong token can't be recovered by timing
+    the response. 503 when unconfigured (the operator has not set it up) vs 401
+    when the header is wrong or missing.
+    """
+    if not ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Admin endpoints are disabled: ADMIN_TOKEN is not configured on the server.")
+    if not token or not secrets.compare_digest(token, ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Admin-Token header.")
+
+
 @app.post("/api/admin/force-refresh")
-async def admin_force_refresh():
+async def admin_force_refresh(x_admin_token: Optional[str] = Header(None)):
     """Admin endpoint to manually trigger today's scrape, upsert to Supabase,
-    and run the summary pass. Returns any source errors."""
+    and run the summary pass. Returns any source errors.
+
+    Requires the X-Admin-Token header."""
+    _require_admin(x_admin_token)
     try:
         status = await _refresh_and_summarize()
         errors = {name: s["error"] for name, s in status.items() if s.get("error")}
@@ -2231,13 +2258,18 @@ async def admin_force_refresh():
 @app.post("/api/admin/backfill")
 async def admin_backfill(
     days: int = Query(30, description="Number of past days to scrape and store (max 90)"),
+    x_admin_token: Optional[str] = Header(None),
 ):
     """One-shot backfill: scrape the last N days (default 30, max 90) and
     upsert everything into the Supabase `notices` table. Safe to run
     multiple times - existing rows are never duplicated (upsert by id).
-    
+
     Use this once after migrating to the new append-only architecture to
-    seed historical data into the `notices` table."""
+    seed historical data into the `notices` table.
+
+    Requires the X-Admin-Token header. This is the expensive one: a 90-day run
+    scrapes every source and summarizes everything new, taking about an hour."""
+    _require_admin(x_admin_token)
     days = min(max(days, 1), 90)  # clamp to 1-90
     loop = asyncio.get_event_loop()
     today = datetime.datetime.now(IST_TZ).date()
@@ -2280,11 +2312,19 @@ def summaries_status():
 
 
 @app.post("/api/summaries/notice/{notice_id:path}")
-def summarize_one(notice_id: str, force: bool = False):
+def summarize_one(notice_id: str, force: bool = False,
+                  x_admin_token: Optional[str] = Header(None)):
     """On-demand summary for a single notice - used by the \"Generate now\"
     fallback in the UI so a visitor doesn't have to wait for the hourly
     pass. Idempotent: if this id is already summarized, returns the
-    existing summary instead of spending another Gemini call on it."""
+    existing summary instead of spending another Gemini call on it.
+
+    `force=true` discards that idempotency and re-spends a Gemini call (plus a
+    document download) on every request, so it is admin-only. The default path
+    stays open because the UI depends on it and costs nothing for a notice that
+    already has a summary."""
+    if force:
+        _require_admin(x_admin_token)
     # Fetch from Supabase directly
     notice = None
     if supabase_client:
