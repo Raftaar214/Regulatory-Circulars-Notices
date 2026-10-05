@@ -346,6 +346,11 @@
             const [pageInput, setPageInput] = useState('1');
             const [ltpToast, setLtpToast] = useState(null);
 
+            // The table body scrolls inside its own container, so paging while
+            // scrolled down left the next page showing its last rows. Reset the
+            // container to the top whenever the page changes.
+            const tableScrollRef = useRef(null);
+
             // Forthcoming results (F&O only). Served by its own read-only
             // endpoint rather than /api/notices, so it has its own state.
             const [resultData, setResultData] = useState([]);
@@ -492,6 +497,11 @@
             useEffect(() => {
                 if (activeQuickFilter === 'result') loadResults();
             }, [activeQuickFilter]);
+
+            useEffect(() => {
+                const el = tableScrollRef.current;
+                if (el) el.scrollTop = 0;
+            }, [page]);
 
             // Export exactly what the table is showing (so an active search
             // narrows the file too), not the whole fetched window.
@@ -1385,7 +1395,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                     </table>
                                 </div>
                             ) : (activeQuickFilter === 'dividend_split_bonus') ? (
-                                <div className="overflow-auto flex-1 table-container">
+                                <div ref={tableScrollRef} className="overflow-auto flex-1 table-container">
                                     <table className="w-full text-left border-collapse relative">
                                         <thead className="sticky top-0 z-10 bg-slate-50 shadow-[0_1px_0_0_#e2e8f0]">
                                             <tr className="text-slate-700">
@@ -1505,7 +1515,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                     </table>
                                 </div>
                             ) : (
-                                <div className="overflow-auto flex-1 table-container">
+                                <div ref={tableScrollRef} className="overflow-auto flex-1 table-container">
                                     <table className="w-full text-left border-collapse relative">
                                         <thead className="sticky top-0 z-10 bg-slate-50 shadow-[0_1px_0_0_#e2e8f0]">
                                             <tr className="text-slate-700">
