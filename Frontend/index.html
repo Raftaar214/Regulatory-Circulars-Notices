@@ -357,6 +357,9 @@
             const [resultWindow, setResultWindow] = useState(null);
             const [resultLoading, setResultLoading] = useState(false);
             const [resultError, setResultError] = useState(null);
+            // 'expiry' = today .. this month's F&O expiry (last Tuesday), the
+            // default. 'month' = today .. today + 1 month.
+            const [resultRange, setResultRange] = useState('expiry');
 
             useEffect(() => {
                 setPageInput(page.toString());
@@ -465,14 +468,52 @@
                 });
             };
 
-            // Forthcoming results. The server defaults the window to
-            // today .. today + 1 month, so past dates fall off on their own as
-            // the date advances - nothing to reset on the client.
-            const loadResults = async () => {
+            // F&O monthly expiry: the last Tuesday of the month.
+            const lastTuesdayOf = (year, monthIdx) => {
+                const d = new Date(year, monthIdx + 1, 0);        // last day of that month
+                d.setDate(d.getDate() - ((d.getDay() - 2 + 7) % 7));  // back up to Tuesday (getDay 2)
+                return d;
+            };
+
+            // The expiry to count toward. Once this month's expiry has passed,
+            // the relevant one is next month's - otherwise the range would run
+            // backwards for the rest of the month.
+            const currentExpiry = (from) => {
+                const thisMonth = lastTuesdayOf(from.getFullYear(), from.getMonth());
+                return from <= thisMonth
+                    ? thisMonth
+                    : lastTuesdayOf(from.getFullYear(), from.getMonth() + 1);
+            };
+
+            // Local YYYY-MM-DD. toISOString() would shift the date in IST.
+            const isoLocal = (d) =>
+                `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+            // 'expiry' -> today .. this month's F&O expiry (default)
+            // 'month'  -> today .. today + 1 month
+            const resultRangeDates = (mode) => {
+                const today = new Date(); today.setHours(0, 0, 0, 0);
+                let to;
+                if (mode === 'month') {
+                    to = new Date(today);
+                    to.setMonth(to.getMonth() + 1);
+                    to.setDate(to.getDate() - 1);   // 12 Oct -> 11 Nov
+                } else {
+                    to = currentExpiry(today);
+                }
+                return { from: isoLocal(today), to: isoLocal(to) };
+            };
+
+            // Forthcoming results. The window is driven by resultRange, and the
+            // `from` is always today, so past dates fall off on their own as the
+            // date advances - nothing to reset on the client.
+            const loadResults = async (mode) => {
+                const { from, to } = resultRangeDates(mode || resultRange);
                 setResultLoading(true);
                 setResultError(null);
                 try {
-                    const response = await fetch(`${API_BASE}/api/results`);
+                    const response = await fetch(
+                        `${API_BASE}/api/results?from_date=${from}&to_date=${to}`);
                     if (!response.ok) {
                         let detail = "";
                         try {
@@ -493,10 +534,10 @@
                 }
             };
 
-            // Fetch only when the Result view is actually opened.
+            // Fetch when the Result view is opened, and whenever the range changes.
             useEffect(() => {
-                if (activeQuickFilter === 'result') loadResults();
-            }, [activeQuickFilter]);
+                if (activeQuickFilter === 'result') loadResults(resultRange);
+            }, [activeQuickFilter, resultRange]);
 
             useEffect(() => {
                 const el = tableScrollRef.current;
@@ -525,7 +566,7 @@
                 const a = document.createElement('a');
                 a.href = url;
                 a.download = resultWindow
-                    ? `fno-results-${resultWindow.from}-to-${resultWindow.to}.csv`
+                    ? `fno-results-${resultRange === 'expiry' ? 'to-expiry' : '1month'}-${resultWindow.from}-to-${resultWindow.to}.csv`
                     : 'fno-results.csv';
                 document.body.appendChild(a);
                 a.click();
@@ -1259,6 +1300,28 @@ ${renderBlock("P3 · Peripheral", p3)}
                                         onKeyDown={(e) => e.key === 'Enter' && handleFilter()}
                                     />
                                 </div>
+
+                                {activeQuickFilter === 'result' && (
+                                    <div className="flex items-center h-[30px] rounded border border-slate-300 overflow-hidden text-[11px] font-semibold">
+                                        {[
+                                            { key: 'expiry', label: `To expiry (${fmtResultDate(resultRangeDates('expiry').to).replace(/ \d{4}$/, '')})`,
+                                              hint: 'Today to this month\'s F&O expiry (last Tuesday)' },
+                                            { key: 'month', label: '1 month',
+                                              hint: `Today to ${fmtResultDate(resultRangeDates('month').to)}` },
+                                        ].map((opt, i) => (
+                                            <button
+                                                key={opt.key}
+                                                title={opt.hint}
+                                                onClick={() => setResultRange(opt.key)}
+                                                className={`px-2.5 h-full transition-colors whitespace-nowrap ${i ? 'border-l border-slate-300' : ''} ${resultRange === opt.key
+                                                    ? 'bg-violet-600 text-white'
+                                                    : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+                                            >
+                                                {opt.label}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
 
                                 {/* The results window is set by the server (today .. +1 month),
                                     so these date inputs don't apply to that view. */}
