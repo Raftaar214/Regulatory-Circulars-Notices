@@ -2783,39 +2783,70 @@ def get_results(
     }
 
 
+# Target hours and minutes in IST (8am, 9am, 10am, 3:30pm, 5pm, 11pm)
+SCHEDULE_SLOTS = [(8, 0), (9, 0), (10, 0), (15, 30), (17, 0), (23, 0)]
+RESULT_SLOTS = {(8, 0), (23, 0)}
+
+# Observability for /api/health - the dashboard looking stale is otherwise
+# indistinguishable from a quiet news day.
+LAST_CYCLE_AT: Optional[str] = None
+LAST_CYCLE_SLOTS: List[str] = []
+
+
 async def _scheduled_job_loop():
     await asyncio.sleep(5)  # let the app finish starting first
-    
-    # Target hours and minutes in IST (8am, 9am, 10am, 3:30pm, 5pm, 11pm)
-    target_times = [(8, 0), (9, 0), (10, 0), (15, 30), (17, 0), (23, 0)]
-    last_run_time = None
-    
+
+    global LAST_CYCLE_AT, LAST_CYCLE_SLOTS
+    done_date: Optional[datetime.date] = None
+    done_slots: set = set()
+
     while True:
         try:
             now = datetime.datetime.now(IST_TZ)
-            current_time = (now.hour, now.minute)
-            
-            # If current time matches one of the target times, and we haven't already run in this minute
-            if current_time in target_times and current_time != last_run_time:
-                logger.info(f"Scheduled time reached: {now.strftime('%H:%M')} IST. Starting refresh.")
-                last_run_time = current_time
+            today = now.date()
+
+            # New IST day - every slot is pending again.
+            if today != done_date:
+                done_date, done_slots = today, set()
+
+            # Catch-up rather than exact-minute matching. This process only
+            # polls while it is awake, and the instance can be spun down,
+            # restarting, or busy inside a previous cycle when a slot's minute
+            # passes - in which case an equality check silently skips that slot
+            # until the next one. Instead, run every slot whose time has already
+            # passed today and hasn't run yet.
+            due = [s for s in SCHEDULE_SLOTS
+                   if s not in done_slots and (now.hour, now.minute) >= s]
+            if due:
+                # Several slots can be due at once after a long sleep. They all
+                # scrape the same window, so collapse them into one cycle
+                # instead of repeating identical work.
+                label = ", ".join(f"{h:02d}:{m:02d}" for h, m in due)
+                logger.info("Scheduled slots due (%s) at %s IST - running refresh.",
+                            label, now.strftime("%H:%M"))
+
                 await _refresh_and_summarize()
-                # Runs every slot but downloads nothing when the stored list is
-                # already the newest available bhavcopy, so a failed 8am run
-                # gets picked up later in the day instead of leaving the list
-                # stale until tomorrow.
+                # Downloads nothing when the stored list is already the newest
+                # available bhavcopy, so a failed morning run is picked up later
+                # in the day instead of leaving the list stale until tomorrow.
                 await _scrape_fno_symbols()
-                # Forthcoming results: 8am and 11pm only. Needs the F&O list
-                # above to be current, so it runs after it.
-                if current_time in ((8, 0), (23, 0)):
+
+                if any(s in RESULT_SLOTS for s in due):
                     try:
                         await _refresh_results()
                     except Exception:
                         logger.exception("Forthcoming results refresh failed")
-                
+
+                # Only mark the slots complete once the cycle actually finished,
+                # so a crash mid-cycle leaves them due for the next poll.
+                done_slots.update(due)
+                LAST_CYCLE_AT = datetime.datetime.now(IST_TZ).isoformat()
+                LAST_CYCLE_SLOTS = [f"{h:02d}:{m:02d}" for h, m in due]
+                logger.info("Scheduled cycle finished for slots: %s", label)
+
         except Exception:
             logger.exception("Scheduled refresh/summarize cycle failed")
-            
+
         # Check every 30 seconds so we don't miss the minute mark
         await asyncio.sleep(30)
 
@@ -2841,6 +2872,13 @@ def health():
         "refresh_interval_seconds": REFRESH_INTERVAL_SECONDS,
         "gemini_model": GEMINI_MODEL,
         "gemini_key_configured": bool(GEMINI_API_KEY),
+        # Null until this process completes a cycle. A null here next to a live
+        # dashboard means the instance was restarted or spun down and has not
+        # caught up yet - previously there was no way to tell that apart from a
+        # genuinely quiet day.
+        "last_cycle_at": LAST_CYCLE_AT,
+        "last_cycle_slots": LAST_CYCLE_SLOTS,
+        "schedule_slots_ist": [f"{h:02d}:{m:02d}" for h, m in SCHEDULE_SLOTS],
     }
 from fastapi.responses import FileResponse, HTMLResponse
 import os
