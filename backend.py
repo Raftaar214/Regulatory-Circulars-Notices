@@ -864,22 +864,51 @@ NSE_BASE = "https://www.nseindia.com"
 _NSE_SESSION = None
 _NSE_WARMUP_LOCK = threading.Lock()
 
-def _nse_warmup_session():
+def _nse_warmup_session(referer: Optional[str] = None):
     """NSE blocks direct API hits without first establishing browser-like
-    cookies - hit the homepage before calling the API."""
+    cookies - hit the homepage before calling the API.
+
+    A 403 on the homepage used to be treated as success, because only
+    exceptions were caught and a 403 is a perfectly valid response object. The
+    resulting cookie-less session was then cached globally and reused for every
+    later call, so one bad warm-up poisoned the whole process. Now the status
+    and the cookie jar are both checked, and when `referer` is given that page
+    is visited too - NSE hands out different cookies per section, and the API
+    checks them against the Referer header we send.
+    """
     global _NSE_SESSION
     with _NSE_WARMUP_LOCK:
         if _NSE_SESSION is not None:
             return _NSE_SESSION
-            
+
         s = new_session()
         s.headers.update(BROWSER_HEADERS)
+        ok = False
         try:
-            s.get(NSE_BASE, timeout=REQUEST_TIMEOUT)
-            time.sleep(0.3)
+            r = s.get(NSE_BASE, timeout=REQUEST_TIMEOUT)
+            ok = r.status_code == 200
+            if not ok:
+                logger.warning("NSE warm-up: homepage returned HTTP %s", r.status_code)
+            else:
+                time.sleep(0.3)
+                if referer:
+                    # Section page, for the cookies the API expects alongside
+                    # the Referer we send.
+                    try:
+                        s.get(referer, timeout=REQUEST_TIMEOUT)
+                        time.sleep(0.2)
+                    except Exception as e:
+                        logger.warning("NSE warm-up: referer page %s failed: %s", referer, e)
         except Exception as e:
             logger.warning(f"NSE session warm-up failed (continuing anyway): {e}")
-            
+
+        try:
+            n_cookies = len(s.cookies)
+        except Exception:
+            n_cookies = -1
+        if ok and n_cookies == 0:
+            logger.warning("NSE warm-up returned 200 but set no cookies - API calls will likely 403.")
+
         _NSE_SESSION = s
         return s
 
@@ -894,22 +923,31 @@ def _fetch_nse_json(path: str, from_date: datetime.date, to_date: datetime.date,
     error = None
 
     try:
-        session = _nse_warmup_session()
-
         params = {
             "fromDate": from_date.strftime("%d-%m-%Y"),
             "toDate": to_date.strftime("%d-%m-%Y"),
         }
 
-        resp = session.get(
-            f"{NSE_BASE}{path}",
-            params=params,
-            headers={"Referer": referer},
-            timeout=REQUEST_TIMEOUT,
-        )
-        
-        if resp.status_code in (401, 403):
+        # A 401/403 here almost always means stale or missing cookies. Clearing
+        # the cached session alone only helped the *next* call, so a single
+        # expired session failed every NSE source for the whole cycle. Re-warm
+        # and retry in place instead.
+        resp = None
+        for attempt in (1, 2):
+            session = _nse_warmup_session(referer)
+            resp = session.get(
+                f"{NSE_BASE}{path}",
+                params=params,
+                headers={"Referer": referer},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if resp.status_code not in (401, 403):
+                break
             _clear_nse_session()
+            if attempt == 1:
+                logger.info("NSE %s returned HTTP %s - re-warming session and retrying.",
+                            path, resp.status_code)
+                time.sleep(1.0)
 
         resp.raise_for_status()
 
@@ -987,10 +1025,26 @@ def fetch_nse_press_releases(from_date: datetime.date, to_date: datetime.date) -
     error = None
     referer = f"{NSE_BASE}/resources/exchange-communication-press-releases"
     try:
-        session = _nse_warmup_session()
         params = {"fromDate": from_date.strftime("%d-%m-%Y"), "toDate": to_date.strftime("%d-%m-%Y")}
-        resp = session.get(f"{NSE_BASE}/api/press-release-cms20", params=params,
-                            headers={"Referer": referer}, timeout=REQUEST_TIMEOUT)
+        resp = None
+        for attempt in (1, 2):
+            session = _nse_warmup_session(referer)
+            resp = session.get(f"{NSE_BASE}/api/press-release-cms20", params=params,
+                                headers={"Referer": referer}, timeout=REQUEST_TIMEOUT)
+            if resp.status_code not in (401, 403):
+                break
+            _clear_nse_session()
+            if attempt == 1:
+                logger.info("NSE press releases returned HTTP %s - re-warming session and retrying.",
+                            resp.status_code)
+                time.sleep(1.0)
+
+        # Previously a non-200 just fell through to an empty list, so a 403
+        # looked identical to "no press releases today" in the logs.
+        if resp.status_code != 200:
+            error = f"HTTP {resp.status_code}"
+            logger.error("NSE press releases failed: HTTP %s", resp.status_code)
+
         if resp.status_code == 200:
             rows = _unwrap_json_rows(resp.json())
             for row in rows:
@@ -1716,24 +1770,31 @@ def fetch_nse_corporate_actions(from_date: datetime.date,
     error = None
     ltp_failed_symbols: List[str] = []
 
+    ca_referer = "https://www.nseindia.com/companies-listing/corporate-filings-actions"
     try:
-        session = _nse_warmup_session()
-
-        response = session.get(
-            "https://www.nseindia.com/api/corporates-corporateActions",
-            params={
-                "index": "equities",
-                "from_date": from_date.strftime("%d-%m-%Y"),
-                "to_date": to_date.strftime("%d-%m-%Y")
-            },
-            headers={
-                "Referer": "https://www.nseindia.com/companies-listing/corporate-filings-actions"
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        
-        if response.status_code in (401, 403):
+        # Same re-warm-and-retry as _fetch_nse_json: a 401/403 here means the
+        # cached session lost its cookies, and giving up immediately meant a
+        # whole day of dividends went missing.
+        response = None
+        for attempt in (1, 2):
+            session = _nse_warmup_session(ca_referer)
+            response = session.get(
+                "https://www.nseindia.com/api/corporates-corporateActions",
+                params={
+                    "index": "equities",
+                    "from_date": from_date.strftime("%d-%m-%Y"),
+                    "to_date": to_date.strftime("%d-%m-%Y")
+                },
+                headers={"Referer": ca_referer},
+                timeout=REQUEST_TIMEOUT,
+            )
+            if response.status_code not in (401, 403):
+                break
             _clear_nse_session()
+            if attempt == 1:
+                logger.info("Dividend API returned HTTP %s - re-warming session and retrying.",
+                            response.status_code)
+                time.sleep(1.0)
 
         response.raise_for_status()
 
