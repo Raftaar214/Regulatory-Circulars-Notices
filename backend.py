@@ -2923,7 +2923,12 @@ async def _on_startup():
         logger.info("ENABLE_SCHEDULER=false - scheduled auto-refresh is disabled.")
 
 
-@app.get("/api/health")
+# HEAD as well as GET: uptime monitors probe with HEAD by default, and a
+# GET-only route answers those with 405, so a perfectly healthy service gets
+# reported as down. FastAPI auto-handles HEAD for a GET route only via
+# Starlette's redirect behaviour, not for the route itself, so it is declared
+# explicitly. The body is discarded on a HEAD response.
+@app.api_route("/api/health", methods=["GET", "HEAD"])
 def health():
     return {
         "status": "ok",
@@ -2944,7 +2949,9 @@ def health():
 from fastapi.responses import FileResponse, HTMLResponse
 import os
 
-@app.get("/", response_class=FileResponse)
+# Render's own platform probe requests HEAD / on boot, which a GET-only route
+# answers with 405. Same reason as /api/health.
+@app.api_route("/", methods=["GET", "HEAD"], response_class=FileResponse)
 def home():
     index_path = os.path.join(os.path.dirname(__file__), "index.html")
     if os.path.exists(index_path):
