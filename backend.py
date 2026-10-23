@@ -146,8 +146,12 @@ STOCKEDGE_PAGE_SIZE = 20
 STOCKEDGE_MAX_PAGES = 80
 EQUITY_MASTER_ROW_ID = "equity_master_latest"
 EQUITY_MASTER_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
-# How long a result stays in Supabase after its date has passed.
+# How long a dividend or result stays in Supabase after its date has passed.
 RESULT_RETENTION_DAYS = int(os.environ.get("RESULT_RETENTION_DAYS", "30"))
+
+# Row types kept only on that rolling window. Notices and circulars are the
+# permanent archive and are never purged.
+ROLLING_RETENTION_TYPES = ("dividend", "result")
 # Rolling window the dashboard shows by default: today .. today + N days.
 RESULT_WINDOW_DAYS = int(os.environ.get("RESULT_WINDOW_DAYS", "30"))
 
@@ -2472,6 +2476,11 @@ async def _refresh_and_summarize():
     # NOTE: We do NOT purge old summaries on a today-only scrape.
     # Summaries live persistently inside the `data` JSON column of the `notices` table.
 
+    # Roll the dividend/result window forward. Runs in every slot rather than
+    # only alongside the results refresh, so dividends are trimmed daily too.
+    # Notices and circulars are never purged.
+    await loop.run_in_executor(None, _purge_old_rows)
+
     if not _try_start_summary_pass():
         logger.info("Scheduled cycle: a summary pass is already running - skipping.")
         return status
@@ -2758,22 +2767,38 @@ def fetch_forthcoming_results() -> List[Dict]:
     return out
 
 
-def _purge_old_results() -> int:
-    """Drop result rows whose date is older than RESULT_RETENTION_DAYS."""
+def _purge_old_rows() -> int:
+    """Keep dividends and results on a rolling one-month window.
+
+    Both are point-in-time market data: a dividend's ex-date or a result date
+    more than a month old has no further use, and dividends in particular were
+    never purged at all, so they had been accumulating since June. Notices and
+    circulars are the permanent archive and are deliberately never touched.
+
+    The window is relative to today, so it rolls on its own: on 23 Oct
+    everything back to 23 Sep is kept, and the next day 23 Sep drops out.
+    """
     if not supabase_client:
         return 0
     cutoff = (datetime.datetime.now(IST_TZ).date()
               - datetime.timedelta(days=RESULT_RETENTION_DAYS)).isoformat()
-    try:
-        resp = (supabase_client.table("notices")
-                .delete().eq("type", "result").lt("date", cutoff).execute())
-        n = len(resp.data or [])
-        if n:
-            logger.info("Purged %d result row(s) older than %s.", n, cutoff)
-        return n
-    except Exception as e:
-        logger.error(f"Failed to purge old results: {e}")
-        return 0
+    total = 0
+    for row_type in ROLLING_RETENTION_TYPES:
+        try:
+            resp = (supabase_client.table("notices")
+                    .delete().eq("type", row_type).lt("date", cutoff).execute())
+            n = len(resp.data or [])
+            total += n
+            if n:
+                logger.info("Purged %d %s row(s) dated before %s.", n, row_type, cutoff)
+        except Exception as e:
+            logger.error(f"Failed to purge old {row_type} rows: {e}")
+    return total
+
+
+# Backwards-compatible alias; the results refresh still calls this name.
+def _purge_old_results() -> int:
+    return _purge_old_rows()
 
 
 async def _refresh_results():
