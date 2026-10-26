@@ -1628,9 +1628,13 @@ ${renderBlock("P3 · Peripheral", p3)}
                                                                 <span className="text-sm text-slate-600">{row.category}</span>
                                                             </td>
                                                             <td className="px-3 py-1.5">
-                                                                <div className="flex items-center gap-2">
+                                                                {/* Titles are shown in full: line-clamp-2 was cutting off the
+                                                                    part that identifies the notice, e.g. which company a
+                                                                    listing or clarification refers to. items-start keeps the
+                                                                    priority badge on the first line when the title wraps. */}
+                                                                <div className="flex items-start gap-2">
                                                                     {row.priority && (
-                                                                        <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider shrink-0
+                                                                        <span className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider shrink-0 mt-0.5
                                                                             ${row.priority === 'P1' ? 'bg-red-100 text-red-700 border border-red-200' :
                                                                                 row.priority === 'P2' ? 'bg-amber-100 text-amber-700 border border-amber-200' :
                                                                                     'bg-blue-100 text-blue-700 border border-blue-200'}`}
@@ -1638,7 +1642,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                                                             {row.priority}
                                                                         </span>
                                                                     )}
-                                                                    <p className="text-sm font-medium text-slate-800 line-clamp-2 leading-snug m-0 p-0" title={cleanTitle(row.title)}>
+                                                                    <p className="text-sm font-medium text-slate-800 leading-snug m-0 p-0 break-words" title={cleanTitle(row.title)}>
                                                                         {cleanTitle(row.title)}
                                                                     </p>
                                                                 </div>
