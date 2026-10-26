@@ -391,12 +391,16 @@ def _notices_fetch(from_date: datetime.date, to_date: datetime.date) -> Optional
     # for convenience but are not notices and must never reach a visitor.
     all_rows = [r for r in all_rows if r.get("type") not in NON_NOTICE_TYPES]
 
+    # Two rows are the same notice only when body, date, title AND link all
+    # match. The key used to be (body, link) alone, which silently dropped
+    # genuinely different notices: BSE bundles several press releases into one
+    # daily PDF, so a company listing and an unrelated investor-caution notice
+    # can share a link and only one of them would ever reach the page.
     deduplicated = []
     seen = set()
     for notice in all_rows:
-        key = (notice.get("body"), notice.get("link"))
-        if not notice.get("link"):
-            key = (notice.get("body"), notice.get("date"), notice.get("title"))
+        key = (notice.get("body"), notice.get("date"),
+               notice.get("title"), notice.get("link"))
         if key in seen:
             continue
         seen.add(key)
