@@ -360,6 +360,9 @@
             // 'expiry' = today .. this month's F&O expiry (last Tuesday), the
             // default. 'month' = today .. today + 1 month.
             const [resultRange, setResultRange] = useState('expiry');
+            // NSE trading holidays, so an expiry landing on one moves back to
+            // the previous trading day (24 Nov 2026 -> 23 Nov).
+            const [holidays, setHolidays] = useState(() => new Set());
 
             useEffect(() => {
                 setPageInput(page.toString());
@@ -382,6 +385,11 @@
             };
 
             useEffect(() => {
+                fetch(`${API_BASE}/api/holidays`)
+                    .then(res => res.json())
+                    .then(data => setHolidays(new Set(data.holidays || [])))
+                    .catch(err => console.error("Error fetching trading holidays", err));
+
                 fetch(`${API_BASE}/api/fno_symbols`)
                     .then(res => res.json())
                     .then(data => {
@@ -468,30 +476,47 @@
                 });
             };
 
-            // F&O monthly expiry: the last Tuesday of the month.
+            // Local YYYY-MM-DD. toISOString() would shift the date in IST.
+            const isoLocal = (d) =>
+                `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+            // F&O monthly expiry: the last Tuesday of the month, moved back to
+            // the previous trading day when that Tuesday is a holiday. E.g.
+            // 24 Nov 2026 is Prakash Gurpurb, so November expires Mon 23 Nov.
             const lastTuesdayOf = (year, monthIdx) => {
                 const d = new Date(year, monthIdx + 1, 0);        // last day of that month
                 d.setDate(d.getDate() - ((d.getDay() - 2 + 7) % 7));  // back up to Tuesday (getDay 2)
                 return d;
             };
 
+            // Step back off weekends and NSE trading holidays.
+            const prevTradingDay = (d, holidaySet) => {
+                const out = new Date(d);
+                for (let i = 0; i < 10; i++) {
+                    const dow = out.getDay();
+                    if (dow !== 0 && dow !== 6 && !holidaySet.has(isoLocal(out))) return out;
+                    out.setDate(out.getDate() - 1);
+                }
+                return out;
+            };
+
+            const expiryOf = (year, monthIdx, holidaySet) =>
+                prevTradingDay(lastTuesdayOf(year, monthIdx), holidaySet);
+
             // The expiry to count toward. Once this month's expiry has passed,
             // the relevant one is next month's - otherwise the range would run
             // backwards for the rest of the month.
-            const currentExpiry = (from) => {
-                const thisMonth = lastTuesdayOf(from.getFullYear(), from.getMonth());
+            const currentExpiry = (from, holidaySet) => {
+                const hs = holidaySet || new Set();
+                const thisMonth = expiryOf(from.getFullYear(), from.getMonth(), hs);
                 return from <= thisMonth
                     ? thisMonth
-                    : lastTuesdayOf(from.getFullYear(), from.getMonth() + 1);
+                    : expiryOf(from.getFullYear(), from.getMonth() + 1, hs);
             };
-
-            // Local YYYY-MM-DD. toISOString() would shift the date in IST.
-            const isoLocal = (d) =>
-                `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
             // 'expiry' -> today .. this month's F&O expiry (default)
             // 'month'  -> today .. today + 1 month
-            const resultRangeDates = (mode) => {
+            const resultRangeDates = (mode, holidaySet) => {
                 const today = new Date(); today.setHours(0, 0, 0, 0);
                 let to;
                 if (mode === 'month') {
@@ -499,7 +524,7 @@
                     to.setMonth(to.getMonth() + 1);
                     to.setDate(to.getDate() - 1);   // 12 Oct -> 11 Nov
                 } else {
-                    to = currentExpiry(today);
+                    to = currentExpiry(today, holidaySet);
                 }
                 return { from: isoLocal(today), to: isoLocal(to) };
             };
@@ -508,7 +533,7 @@
             // `from` is always today, so past dates fall off on their own as the
             // date advances - nothing to reset on the client.
             const loadResults = async (mode) => {
-                const { from, to } = resultRangeDates(mode || resultRange);
+                const { from, to } = resultRangeDates(mode || resultRange, holidays);
                 setResultLoading(true);
                 setResultError(null);
                 try {
@@ -534,10 +559,12 @@
                 }
             };
 
-            // Fetch when the Result view is opened, and whenever the range changes.
+            // Fetch when the Result view is opened, and whenever the range
+            // changes. `holidays` is a dependency because the expiry date
+            // shifts once the holiday list arrives.
             useEffect(() => {
                 if (activeQuickFilter === 'result') loadResults(resultRange);
-            }, [activeQuickFilter, resultRange]);
+            }, [activeQuickFilter, resultRange, holidays]);
 
             useEffect(() => {
                 const el = tableScrollRef.current;
@@ -1304,10 +1331,10 @@ ${renderBlock("P3 · Peripheral", p3)}
                                 {activeQuickFilter === 'result' && (
                                     <div className="flex items-center h-[30px] rounded border border-slate-300 overflow-hidden text-[11px] font-semibold">
                                         {[
-                                            { key: 'expiry', label: `To expiry (${fmtResultDate(resultRangeDates('expiry').to).replace(/ \d{4}$/, '')})`,
-                                              hint: 'Today to this month\'s F&O expiry (last Tuesday)' },
+                                            { key: 'expiry', label: `To expiry (${fmtResultDate(resultRangeDates('expiry', holidays).to).replace(/ \d{4}$/, '')})`,
+                                              hint: 'Today to the F&O monthly expiry (last Tuesday, moved back if it is a trading holiday)' },
                                             { key: 'month', label: '1 month',
-                                              hint: `Today to ${fmtResultDate(resultRangeDates('month').to)}` },
+                                              hint: `Today to ${fmtResultDate(resultRangeDates('month', holidays).to)}` },
                                         ].map((opt, i) => (
                                             <button
                                                 key={opt.key}

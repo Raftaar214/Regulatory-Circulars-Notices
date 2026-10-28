@@ -137,7 +137,7 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 # never appear in the notices feed or be sent to Gemini. `result` rows are
 # forthcoming earnings dates served by their own /api/results endpoint; there is
 # no source document to read, so summarizing them would burn quota for nothing.
-NON_NOTICE_TYPES = {"fno_symbols", "equity_master", "result"}
+NON_NOTICE_TYPES = {"fno_symbols", "equity_master", "result", "holidays"}
 
 # --- Forthcoming results (StockEdge) ---------------------------------------
 STOCKEDGE_API = "https://api.stockedge.com/Api"
@@ -146,6 +146,11 @@ STOCKEDGE_PAGE_SIZE = 20
 STOCKEDGE_MAX_PAGES = 80
 EQUITY_MASTER_ROW_ID = "equity_master_latest"
 EQUITY_MASTER_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+
+# NSE trading holidays, used to move an expiry off a non-trading day.
+HOLIDAYS_ROW_ID = "trading_holidays_latest"
+HOLIDAYS_URL = "https://www.nseindia.com/api/holiday-master?type=trading"
+HOLIDAYS_REFERER = "https://www.nseindia.com/resources/exchange-communication-holidays"
 # How long a dividend or result stays in Supabase after its date has passed.
 RESULT_RETENTION_DAYS = int(os.environ.get("RESULT_RETENTION_DAYS", "30"))
 
@@ -2685,6 +2690,65 @@ def _refresh_equity_master() -> int:
         return 0
 
 
+def _refresh_trading_holidays() -> int:
+    """Store NSE's trading-holiday list so expiry dates can skip non-trading days.
+
+    The F&O monthly expiry is the last Tuesday of the month, but when that
+    Tuesday is a trading holiday the expiry moves to the previous trading day -
+    e.g. 24 Nov 2026 is Prakash Gurpurb, so November expires on Mon 23 Nov.
+    """
+    try:
+        session = _nse_warmup_session(HOLIDAYS_REFERER)
+        resp = session.get(HOLIDAYS_URL, headers={"Referer": HOLIDAYS_REFERER},
+                           timeout=REQUEST_TIMEOUT)
+        if resp.status_code != 200:
+            logger.warning("Holiday master fetch returned HTTP %s", resp.status_code)
+            return 0
+        payload = resp.json() or {}
+        # Prefer the capital-market list; fall back to F&O, then anything present.
+        entries = payload.get("CM") or payload.get("FO") or next(iter(payload.values()), [])
+        days = []
+        for h in entries:
+            raw = (h.get("tradingDate") or "").strip()
+            for fmt in ("%d-%b-%Y", "%d-%B-%Y", "%Y-%m-%d"):
+                try:
+                    days.append(datetime.datetime.strptime(raw, fmt).date().isoformat())
+                    break
+                except ValueError:
+                    continue
+        days = sorted(set(days))
+        if not days:
+            logger.warning("Holiday master returned no parseable dates.")
+            return 0
+        if supabase_client:
+            supabase_client.table("notices").upsert({
+                "id": HOLIDAYS_ROW_ID,
+                "date": datetime.datetime.now(IST_TZ).date().isoformat(),
+                "type": "holidays",
+                "data": {"holidays": days, "count": len(days)},
+            }).execute()
+        logger.info("Trading holidays refreshed: %d date(s).", len(days))
+        return len(days)
+    except Exception as e:
+        logger.error(f"Failed to refresh trading holidays: {e}")
+        return 0
+
+
+@app.get("/api/holidays")
+def get_holidays():
+    """Read-only list of NSE trading holidays (YYYY-MM-DD). The scheduler is
+    the only writer; a visitor request never hits NSE."""
+    if supabase_client:
+        try:
+            resp = (supabase_client.table("notices")
+                    .select("data").eq("id", HOLIDAYS_ROW_ID).limit(1).execute())
+            if resp.data:
+                return resp.data[0]["data"]
+        except Exception as e:
+            logger.error(f"Error reading trading holidays: {e}")
+    return {"holidays": [], "count": 0}
+
+
 def _stockedge_get(path: str) -> Any:
     session = new_session()
     session.headers.update(BROWSER_HEADERS)
@@ -2810,6 +2874,7 @@ async def _refresh_results():
     them, and purge anything past the retention window."""
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _refresh_equity_master)
+    await loop.run_in_executor(None, _refresh_trading_holidays)
     rows = await loop.run_in_executor(None, fetch_forthcoming_results)
     if rows:
         await loop.run_in_executor(None, _notices_upsert, rows)
