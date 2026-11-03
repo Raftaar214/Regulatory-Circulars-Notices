@@ -1588,7 +1588,9 @@ def _extract_dividend_amount(subject: str) -> Optional[float]:
     if re.search(r'(bonus|split|face value|sub-division)', subject, re.IGNORECASE):
         return None
         
-    matches = re.findall(r'(?:Rs\.?|Re\.?)\s*([\d.]+)', subject, re.IGNORECASE)
+    # The optional dash covers BSE's phrasing ("Interim Dividend - Rs. - 24.0000")
+    # alongside NSE's ("Rs 125/-", "Rs.5.50", "Re 1/-").
+    matches = re.findall(r'(?:Rs\.?|Re\.?)\s*-?\s*([\d.]+)', subject, re.IGNORECASE)
     if matches:
         total = 0.0
         for m in matches:
@@ -1776,6 +1778,100 @@ def _maybe_fetch_ltp_sync(symbols: List[str]):
         logger.info("Scheduled LTP fetch done: %d/%d fresh.", len(ltp_map), len(unique_syms))
 
 
+STOCKEDGE_CA_PATH = "DailyDashboardApi/GetDailyCorporateActions"
+
+
+def fetch_stockedge_corporate_actions(from_date: datetime.date,
+                                      to_date: datetime.date) -> List[Dict]:
+    """Corporate actions from StockEdge, shaped exactly like the NSE ones.
+
+    NSE intermittently 403s this host - every endpoint including the homepage -
+    which wipes out a day of dividends. StockEdge carries the same events, is
+    already used for the forthcoming-results view, and has never been blocked.
+
+    The feed is forward-looking from the `date` parameter, which is what the
+    dashboard needs: the scheduler refreshes today's ex-dates each morning.
+
+    Ids reuse the NSE form `dividend-{symbol}-{ex_date}`, so a row recovered
+    during an outage collapses onto the same record when NSE returns instead of
+    duplicating. Tickers come from NSE's cached equity master - a name that
+    can't be resolved is skipped rather than guessed, because a wrong ticker
+    would put the wrong company on a dividend.
+    """
+    out: List[Dict] = []
+    try:
+        name_map = _equity_master_map()
+        if not name_map:
+            logger.warning("StockEdge fallback: equity master is empty, cannot resolve tickers.")
+            return []
+
+        raw: List[Dict] = []
+        for page in range(1, STOCKEDGE_MAX_PAGES + 1):
+            batch = _stockedge_get(
+                f"{STOCKEDGE_CA_PATH}?page={page}&pageSize={STOCKEDGE_PAGE_SIZE}"
+                f"&EventType=null&lang=en&date={from_date.isoformat()}")
+            if not batch:
+                break
+            raw.extend(batch)
+            # Rows arrive in date order; stop once past the window.
+            if all(str(x.get("Date") or "")[:10] > to_date.isoformat() for x in batch):
+                break
+            time.sleep(INTER_REQUEST_DELAY)
+
+        unresolved: List[str] = []
+        for row in raw:
+            ex_date = str(row.get("Date") or "")[:10]
+            name = _clean(row.get("SecurityName"))
+            purpose = _clean(row.get("Purpose"))
+            if not ex_date or not name:
+                continue
+            if not (from_date.isoformat() <= ex_date <= to_date.isoformat()):
+                continue
+
+            key = _normalize_company(name)
+            symbol = name_map.get(key) or RESULT_NAME_ALIASES.get(key)
+            if not symbol:
+                unresolved.append(name)
+                continue
+
+            amount = _extract_dividend_amount(purpose)
+            ltp = _stockedge_ltp(row.get("SecurityID"))
+            out.append({
+                "id": f"dividend-{symbol}-{ex_date}",
+                "type": "dividend",
+                # Kept as NSE so the dividend view, its F&O filter and the id
+                # scheme behave identically; `source` records the origin.
+                "body": "NSE",
+                "source": "StockEdge",
+                "category": "Dividend",
+                "date": ex_date,
+                "title": name,
+                "symbol": symbol,
+                "company": name,
+                "subject": purpose,
+                "ex_date": ex_date,
+                "record_date": None,
+                "face_value": "",
+                "link": f"https://web.stockedge.com/share/{row.get('SecuritySlug')}"
+                        f"/{row.get('SecurityID')}",
+                "ltp": ltp,
+                "ltp_cached": False,
+                "dividend_amount": amount,
+                "dividend_pct": (round((amount / ltp) * 100, 2)
+                                 if ltp and amount and ltp > 0 else None),
+            })
+
+        if unresolved:
+            logger.info("StockEdge fallback: %d name(s) had no NSE ticker and were "
+                        "skipped rather than guessed (mostly REITs/InvITs/SMEs): %s",
+                        len(unresolved), unresolved[:4])
+        logger.info("StockEdge corporate actions fallback: %d feed row(s) -> %d dividend(s).",
+                    len(raw), len(out))
+    except Exception as e:
+        logger.error(f"StockEdge corporate actions fallback failed: {e}")
+    return out
+
+
 def fetch_nse_corporate_actions(from_date: datetime.date,
                                 to_date: datetime.date) -> Dict:
 
@@ -1904,6 +2000,20 @@ def fetch_nse_corporate_actions(from_date: datetime.date,
     except Exception as e:
         logger.exception("Dividend fetch failed")
         error = str(e)
+
+    # NSE unreachable - fall back to StockEdge, which carries the same ex-dates
+    # and is not subject to NSE's intermittent IP blocking. Gated on `error`
+    # rather than an empty list: a day with genuinely no NSE dividends must not
+    # pull in listings NSE does not carry, so a healthy NSE behaves exactly as
+    # before.
+    if error and not notices:
+        fallback = fetch_stockedge_corporate_actions(from_date, to_date)
+        if fallback:
+            notices = fallback
+            ltp_failed_symbols = [n["symbol"] for n in fallback if n.get("ltp") is None]
+            logger.info("Dividends served from StockEdge fallback (%d row(s)); NSE error was: %s",
+                        len(fallback), error or "no rows returned")
+            error = None
 
     return {
         "data": notices,
@@ -2755,6 +2865,17 @@ def _stockedge_get(path: str) -> Any:
     resp = session.get(f"{STOCKEDGE_API}/{path}", timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     return resp.json()
+
+
+def _stockedge_ltp(security_id) -> Optional[float]:
+    """Last traded price from StockEdge. Used on the dividend fallback path -
+    NSE's quote endpoint is unreachable whenever its corporate-actions API is."""
+    try:
+        data = _stockedge_get(f"SecurityDashboardApi/GetCompanyEquityInfo/{security_id}?lang=en")
+        ltp = (data or {}).get("LTP")
+        return float(ltp) if ltp is not None else None
+    except Exception:
+        return None
 
 
 def _stockedge_is_fo(security_id: int) -> Optional[bool]:
