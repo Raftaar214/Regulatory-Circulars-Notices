@@ -143,7 +143,12 @@ NON_NOTICE_TYPES = {"fno_symbols", "equity_master", "result", "holidays"}
 STOCKEDGE_API = "https://api.stockedge.com/Api"
 # The feed endpoint rejects pageSize > 20 with HTTP 400.
 STOCKEDGE_PAGE_SIZE = 20
-STOCKEDGE_MAX_PAGES = 80
+# Safety stop for the paging loops, not an expected limit. It was 80, which the
+# forthcoming-results feed outgrew during earnings season: the feed ran to 83
+# pages and the loop cut off at 80, silently dropping the last pages. Those
+# happen to hold the furthest-out dates, so results beyond ~3 days simply never
+# appeared. Reaching this cap now logs a warning instead of truncating quietly.
+STOCKEDGE_MAX_PAGES = int(os.environ.get("STOCKEDGE_MAX_PAGES", "500"))
 EQUITY_MASTER_ROW_ID = "equity_master_latest"
 EQUITY_MASTER_URL = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
 
@@ -2892,6 +2897,7 @@ def fetch_forthcoming_results() -> List[Dict]:
     """Forthcoming result dates for F&O stocks, newest page first."""
     raw: List[Dict] = []
     try:
+        page = 0
         for page in range(1, STOCKEDGE_MAX_PAGES + 1):
             batch = _stockedge_get(
                 "DailyDashboardApi/GetForthcomingCorporateActionResults"
@@ -2900,6 +2906,13 @@ def fetch_forthcoming_results() -> List[Dict]:
                 break
             raw.extend(batch)
             time.sleep(INTER_REQUEST_DELAY)
+        else:
+            # The feed is ordered nearest-date-first, so a truncated read drops
+            # the furthest-out results - exactly the ones the expiry window
+            # needs. Never fail silently here.
+            logger.warning("Forthcoming results hit the %d-page cap (%d rows); "
+                           "later dates may be missing. Raise STOCKEDGE_MAX_PAGES.",
+                           STOCKEDGE_MAX_PAGES, len(raw))
     except Exception as e:
         logger.error(f"Forthcoming results fetch failed: {e}")
         return []
