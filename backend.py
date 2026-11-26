@@ -2355,6 +2355,7 @@ def _build_dataset(from_date: datetime.date, to_date: datetime.date,
 def get_all_notices(
     from_date: Optional[str] = Query(None, description="YYYY-MM-DD, defaults to 7 days ago"),
     to_date: Optional[str] = Query(None, description="YYYY-MM-DD, defaults to today"),
+    types: Optional[str] = Query(None, description="Comma-separated row types to return, e.g. 'dividend'"),
 ):
     """Returns notices/circulars/press releases from NSE, NSE Clearing, BSE,
     SEBI, MCX, MCXCCL, IFSCA for the given date window.
@@ -2394,13 +2395,19 @@ def get_all_notices(
     # Date-filter (Supabase already filters, but RAM cache may have extras)
     from_iso = from_d.isoformat()
     to_iso = to_d.isoformat()
+    # `types` lets a caller ask for one kind explicitly. Without it the old
+    # rule stands: dividends are hidden on a multi-day window so they don't
+    # swamp the notices list. With types=dividend the caller wants exactly
+    # those, over whatever range it asked for - that is how the corporate
+    # actions view shows everything up to the current F&O expiry.
+    wanted = {t.strip() for t in types.split(",") if t.strip()} if types else None
     raw_notices = [
         n for n in all_notices
         if from_iso <= (n.get("date") or "") <= to_iso
         and n.get("type") not in NON_NOTICE_TYPES
-        and not (
-            n.get("type") == "dividend"
-            and from_d != to_d
+        and (
+            n.get("type") in wanted if wanted is not None
+            else not (n.get("type") == "dividend" and from_d != to_d)
         )
     ]
 

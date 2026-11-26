@@ -360,6 +360,8 @@
             // 'expiry' = today .. this month's F&O expiry (last Tuesday), the
             // default. 'month' = today .. today + 1 month.
             const [resultRange, setResultRange] = useState('expiry');
+            // Same two options for the corporate-actions view.
+            const [caRange, setCaRange] = useState('expiry');
             // NSE trading holidays, so an expiry landing on one moves back to
             // the previous trading day (24 Nov 2026 -> 23 Nov).
             const [holidays, setHolidays] = useState(() => new Set());
@@ -411,6 +413,11 @@
                         from_date: appliedDateRange.fromDate,
                         to_date: appliedDateRange.toDate,
                     });
+                    // Without this the backend hides dividends on any
+                    // multi-day window, which would empty this view.
+                    if (activeQuickFilter === 'dividend_split_bonus') {
+                        params.set('types', 'dividend');
+                    }
 
                     const response = await fetch(`${API_BASE}/api/notices?${params.toString()}`);
 
@@ -558,6 +565,17 @@
                     setResultLoading(false);
                 }
             };
+
+            // Keep the corporate-actions window in step with its range toggle
+            // and with the holiday list, which shifts the expiry date once it
+            // arrives.
+            useEffect(() => {
+                if (activeQuickFilter !== 'dividend_split_bonus') return;
+                const r = resultRangeDates(caRange, holidays);
+                setFilterFromDate(r.from);
+                setFilterToDate(r.to);
+                setAppliedDateRange({ fromDate: r.from, toDate: r.to });
+            }, [caRange, holidays, activeQuickFilter]);
 
             // Fetch when the Result view is opened, and whenever the range
             // changes. `holidays` is a dependency because the expiry date
@@ -744,15 +762,18 @@
                     const newFilter = prev === type ? null : type;
 
                     if (newFilter === 'dividend_split_bonus') {
-                        // Do not briefly show the previous seven-day data
-                        // while the today-only request is in flight.
+                        // Corporate actions are announced ahead of their ex-date,
+                        // so this view runs today .. current F&O expiry rather
+                        // than today only - otherwise an announced bonus stays
+                        // invisible until the morning it goes ex.
                         setAllData([]);
                         setSourceStatus({});
                         setFilterBody('All');
                         setFilterCategory('All');
-                        setFilterFromDate(todayISO);
-                        setFilterToDate(todayISO);
-                        setAppliedDateRange({ fromDate: todayISO, toDate: todayISO });
+                        const r = resultRangeDates(caRange, holidays);
+                        setFilterFromDate(r.from);
+                        setFilterToDate(r.to);
+                        setAppliedDateRange({ fromDate: r.from, toDate: r.to });
                     } else if (prev === 'dividend_split_bonus' && newFilter !== 'dividend_split_bonus') {
                         setFilterFromDate(sevenDaysAgoISO);
                         setFilterToDate(todayISO);
@@ -1188,7 +1209,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                         </h1>
                                         <p className="text-slate-500 text-xs mt-0.5">
                                             {(activeQuickFilter === 'dividend_split_bonus')
-                                                ? 'Latest dividend announcements sorted by Ex-Date.'
+                                                ? `Dividends, splits and bonuses by Ex-Date · ${fmtResultDate(appliedDateRange.fromDate)} to ${fmtResultDate(appliedDateRange.toDate)}.`
                                                 : (activeQuickFilter === 'result')
                                                 ? `Upcoming result dates for F&O stocks${resultWindow ? ` · ${fmtResultDate(resultWindow.from)} to ${fmtResultDate(resultWindow.to)}` : ''}.`
                                                 : 'Live circulars and notices scored by priority relevance.'}
@@ -1328,7 +1349,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                     />
                                 </div>
 
-                                {activeQuickFilter === 'result' && (
+                                {(activeQuickFilter === 'result' || activeQuickFilter === 'dividend_split_bonus') && (
                                     <div className="flex items-center h-[30px] rounded border border-slate-300 overflow-hidden text-[11px] font-semibold">
                                         {[
                                             { key: 'expiry', label: `To expiry (${fmtResultDate(resultRangeDates('expiry', holidays).to).replace(/ \d{4}$/, '')})`,
@@ -1339,9 +1360,10 @@ ${renderBlock("P3 · Peripheral", p3)}
                                             <button
                                                 key={opt.key}
                                                 title={opt.hint}
-                                                onClick={() => setResultRange(opt.key)}
-                                                className={`px-2.5 h-full transition-colors whitespace-nowrap ${i ? 'border-l border-slate-300' : ''} ${resultRange === opt.key
-                                                    ? 'bg-violet-600 text-white'
+                                                onClick={() => (activeQuickFilter === 'result'
+                                                    ? setResultRange(opt.key) : setCaRange(opt.key))}
+                                                className={`px-2.5 h-full transition-colors whitespace-nowrap ${i ? 'border-l border-slate-300' : ''} ${(activeQuickFilter === 'result' ? resultRange : caRange) === opt.key
+                                                    ? (activeQuickFilter === 'result' ? 'bg-violet-600 text-white' : 'bg-emerald-600 text-white')
                                                     : 'bg-white text-slate-600 hover:bg-slate-50'}`}
                                             >
                                                 {opt.label}
