@@ -233,6 +233,28 @@
         };
 
         // Helper to extract dividend amount
+        // What kind of corporate action this row is. Checked most-specific
+        // first: a split subject reads "Face Value Split (Sub-Division)" and a
+        // buyback "Buy Back of Shares", so matching "dividend" last keeps those
+        // from being mislabelled.
+        const CA_TYPES = [
+            [/bonus/i,                    'Bonus',         'bg-violet-100 text-violet-700 border-violet-200'],
+            [/split|sub-?division/i,      'Split',         'bg-sky-100 text-sky-700 border-sky-200'],
+            [/consolidation/i,            'Consolidation', 'bg-amber-100 text-amber-700 border-amber-200'],
+            [/buy\s*back/i,               'Buyback',       'bg-rose-100 text-rose-700 border-rose-200'],
+            [/rights/i,                   'Rights',        'bg-indigo-100 text-indigo-700 border-indigo-200'],
+            [/redemption/i,               'Redemption',    'bg-slate-100 text-slate-700 border-slate-200'],
+            [/interest\s*payment/i,       'Interest',      'bg-slate-100 text-slate-700 border-slate-200'],
+            [/distribution/i,             'Distribution',  'bg-teal-100 text-teal-700 border-teal-200'],
+            [/dividend/i,                 'Dividend',      'bg-emerald-100 text-emerald-700 border-emerald-200'],
+        ];
+        const actionType = (subject) => {
+            const t = (subject || '').trim();
+            if (!t) return null;
+            for (const [re, label, cls] of CA_TYPES) if (re.test(t)) return { label, cls };
+            return { label: 'Other', cls: 'bg-slate-100 text-slate-600 border-slate-200' };
+        };
+
         const extractDividendAmount = (subject) => {
             if (!subject) return "";
             
@@ -1466,18 +1488,19 @@ ${renderBlock("P3 · Peripheral", p3)}
                                         <thead className="sticky top-0 z-10 bg-slate-50 shadow-[0_1px_0_0_#e2e8f0]">
                                             <tr className="text-slate-700">
                                                 <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[140px]">Symbol</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm">Company</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm w-[420px]">Company</th>
                                                 <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[150px]">Result Date</th>
+                                                <th className="px-3 py-1.5"></th>
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-100">
                                             {resultLoading ? (
-                                                <tr><td colSpan="3" className="px-3 py-10 text-center text-slate-500 text-sm">Loading forthcoming results…</td></tr>
+                                                <tr><td colSpan="4" className="px-3 py-10 text-center text-slate-500 text-sm">Loading forthcoming results…</td></tr>
                                             ) : resultError ? (
-                                                <tr><td colSpan="3" className="px-3 py-10 text-center text-rose-600 text-sm">{resultError}</td></tr>
+                                                <tr><td colSpan="4" className="px-3 py-10 text-center text-rose-600 text-sm">{resultError}</td></tr>
                                             ) : displayedResults.length === 0 ? (
                                                 <tr>
-                                                    <td colSpan="3" className="px-3 py-12 text-center">
+                                                    <td colSpan="4" className="px-3 py-12 text-center">
                                                         <Icon name="calendar-x" className="w-8 h-8 text-slate-300 mx-auto" />
                                                         <p className="mt-2 text-slate-500 text-sm font-medium">No forthcoming results</p>
                                                         <p className="text-slate-400 text-xs mt-0.5">No F&amp;O stock has a result date in this window yet.</p>
@@ -1499,6 +1522,7 @@ ${renderBlock("P3 · Peripheral", p3)}
                                                             <td className={`px-3 py-2 text-sm align-top whitespace-nowrap ${isNewDate ? 'font-semibold text-slate-800' : 'text-slate-500'}`}>
                                                                 {fmtResultDate(row.date)}
                                                             </td>
+                                                            <td className="px-3 py-2"></td>
                                                         </tr>
                                                     );
                                                 })
@@ -1522,9 +1546,10 @@ ${renderBlock("P3 · Peripheral", p3)}
                                                         )}
                                                     </div>
                                                 </th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Company</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Dividend</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">LTP</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm min-w-[190px]">Company</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[120px]">Type</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[130px]">Dividend</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[110px]">LTP</th>
                                                 <th 
                                                     className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap cursor-pointer hover:bg-slate-100 transition-colors"
                                                     onClick={() => handleSort('div_percent')}
@@ -1536,17 +1561,17 @@ ${renderBlock("P3 · Peripheral", p3)}
                                                         )}
                                                     </div>
                                                 </th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Ex Date</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Record Date</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Face Value</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm min-w-[250px]">Summary</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm text-center whitespace-nowrap">Document</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[115px]">Ex Date</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[125px]">Record Date</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[100px]">Face Value</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm min-w-[340px]">Summary</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm text-center whitespace-nowrap w-[90px]">Document</th>
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-slate-200">
                                             {isLoading ? (
                                                 <tr>
-                                                    <td colSpan="10" className="px-6 py-16 text-center text-slate-500">
+                                                    <td colSpan="11" className="px-6 py-16 text-center text-slate-500">
                                                         <div className="flex flex-col items-center justify-center space-y-3">
                                                             <Icon name="loader-2" className="w-8 h-8 text-indigo-600 animate-spin" />
                                                             <p className="text-base font-medium">Fetching live circulars and notices…</p>
@@ -1561,9 +1586,19 @@ ${renderBlock("P3 · Peripheral", p3)}
 
                                                     return (
                                                         <tr key={rowKey} className="hover:bg-slate-50 transition-colors group">
-                                                            <td className="px-3 py-1.5 text-sm font-medium text-slate-800">{row.symbol}</td>
-                                                            <td className="px-3 py-1.5 text-sm text-slate-600">{row.company}</td>
-                                                            <td className="px-3 py-1.5 text-sm font-medium text-slate-800">{extractDividendAmount(row.subject)}</td>
+                                                            <td className="px-3 py-1.5 text-sm font-medium text-slate-800 whitespace-nowrap">{row.symbol}</td>
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600 align-top">{row.company}</td>
+                                                            <td className="px-3 py-1.5 align-top whitespace-nowrap">
+                                                                {(() => {
+                                                                    const t = actionType(row.subject);
+                                                                    return t ? (
+                                                                        <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold border ${t.cls}`}>
+                                                                            {t.label}
+                                                                        </span>
+                                                                    ) : <span className="text-slate-400 italic">—</span>;
+                                                                })()}
+                                                            </td>
+                                                            <td className="px-3 py-1.5 text-sm font-medium text-slate-800 whitespace-nowrap">{extractDividendAmount(row.subject)}</td>
                                                             <td className="px-3 py-1.5 text-sm text-slate-600 whitespace-nowrap">
                                                                 {row.ltp != null ? `₹${Number(row.ltp).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : <span className="text-slate-400 italic">—</span>}
                                                             </td>
@@ -1579,9 +1614,9 @@ ${renderBlock("P3 · Peripheral", p3)}
                                                                     </span>
                                                                 ) : <span className="text-slate-400 italic">—</span>}
                                                             </td>
-                                                            <td className="px-3 py-1.5 text-sm text-slate-600">{row.ex_date}</td>
-                                                            <td className="px-3 py-1.5 text-sm text-slate-600">{row.record_date}</td>
-                                                            <td className="px-3 py-1.5 text-sm text-slate-600">{row.face_value}</td>
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600 whitespace-nowrap">{row.ex_date}</td>
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600 whitespace-nowrap">{row.record_date}</td>
+                                                            <td className="px-3 py-1.5 text-sm text-slate-600 whitespace-nowrap">{row.face_value}</td>
                                                             <td className="px-3 py-1.5">
                                                                 {effectiveSummary ? (
                                                                     <ExpandableSummary text={effectiveSummary} />
@@ -1631,12 +1666,12 @@ ${renderBlock("P3 · Peripheral", p3)}
                                     <table className="w-full text-left border-collapse relative">
                                         <thead className="sticky top-0 z-10 bg-slate-50 shadow-[0_1px_0_0_#e2e8f0]">
                                             <tr className="text-slate-700">
-                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Regulatory Body</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Date</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap">Category</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap min-w-[110px]">Regulatory Body</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm whitespace-nowrap w-[115px]">Date</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm min-w-[130px]">Category</th>
                                                 <th className="px-3 py-1.5 font-semibold text-sm min-w-[300px]">Title</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm min-w-[250px]">Summary</th>
-                                                <th className="px-3 py-1.5 font-semibold text-sm text-center whitespace-nowrap">Document</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm min-w-[340px]">Summary</th>
+                                                <th className="px-3 py-1.5 font-semibold text-sm text-center whitespace-nowrap w-[90px]">Document</th>
                                                 <th className="px-3 py-1.5 text-center w-[40px]">
                                                     <input
                                                         type="checkbox"
